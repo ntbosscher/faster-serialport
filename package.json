@@ -11,14 +11,15 @@
     "@serialport/binding-abstract": "^9.0.2",
     "@serialport/parser-readline": "^9.0.1",
     "debug": "^4.1.1",
-    "nan": "2.24.0",
+    "nan": "2.25.0",
     "node-bindings": "https://github.com/ntbosscher/node-bindings"
   },
   "devDependencies": {
     "@serialport/binding-mock": "^9.0.2",
     "node-abi": "3.8.0",
     "node-cmake": "^2.5.1",
-    "prebuildify": "5.0.1"
+    "prebuildify": "6.0.1",
+    "node-gyp": "12.2.0"
   },
   "engines": {
     "node": ">=8.6.0"

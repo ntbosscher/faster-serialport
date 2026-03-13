@@ -1,4 +1,7 @@
 {
+  'variables': {
+    'standalone_static_library': 0,
+  },
   'targets': [{
     'target_name': 'faster-serial-port',
     'win_delay_load_hook': 'true',
