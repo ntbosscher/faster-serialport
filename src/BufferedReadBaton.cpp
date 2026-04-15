@@ -19,18 +19,15 @@ void reader(BufferedReadBaton* baton) {
 
     char* buffer = (char*)malloc(sizeof(char) * length);
     char errorString[ERROR_STRING_SIZE];
-    
+
     int noDataDeadlineMs = 10 * 1000;
     int received = 0;
     int noDataForMs = 0;
     long totalCount = 0;
 
-    // baton->logVerbose("started reader thread");
-
     for(;;) {
-        
+
         if(noDataForMs > noDataDeadlineMs) {
-            // baton->logVerbose("timed out after 10s");
             break;
         }
 
@@ -47,23 +44,20 @@ void reader(BufferedReadBaton* baton) {
 
             continue;
         }
-        
+
         if(got < 0) {
             std::this_thread::sleep_for (std::chrono::milliseconds(1));
             noDataForMs += 1;
 
-            // baton->logVerbose(std::string("got error: ") + std::string(errorString));
             free(buffer);
-            
+
             {
                 std::unique_lock<std::mutex> lck(baton->syncMutex);
-        
                 strcpy(baton->errorString, errorString);
-                baton->readThreadIsRunning = false;
-
-                baton->signal.notify_one();
+                baton->readerDone = true;
             }
 
+            uv_async_send(&baton->async);
             return;
         }
 
@@ -86,13 +80,12 @@ void reader(BufferedReadBaton* baton) {
         free(buffer);
     }
 
-    // baton->logVerbose(std::string("finished, got ") + std::to_string(totalCount) + std::string(" bytes\n"));
-
     {
         std::unique_lock<std::mutex> lck(baton->syncMutex);
-        baton->readThreadIsRunning = false;
-        baton->signal.notify_one();
+        baton->readerDone = true;
     }
+
+    uv_async_send(&baton->async);
 }
 
 
@@ -104,95 +97,71 @@ void BufferedReadBaton::push(char* buffer, int length) {
     item->length = length;
     queue.push(item);
 
-    signal.notify_one();
+    lck.unlock();
+    uv_async_send(&async);
 }
 
-NAN_INLINE void noop_execute (uv_work_t* req) {
-	// filler fx
+void BufferedReadBaton::onAsync(uv_async_t* handle) {
+    auto baton = static_cast<BufferedReadBaton*>(handle->data);
+    baton->drain();
 }
 
-class BufferedReadResponseBaton: public BatonBase {
-public:
-    BufferedReadBaton *parent;
-    char* buffer;
-    int length;
-    bool found = false;
-    int id = 0;
-    std::string baseName;
+void BufferedReadBaton::drain() {
+    Nan::HandleScope scope;
 
-    BufferedReadResponseBaton(BufferedReadBaton *parent, std::string name, std::string baseName, v8::Local<v8::Function> callback_, int id) 
-        : BatonBase(name, callback_)
-    {
-        request.data = this;
-        this->parent = parent;
-        this->id = id;
-        this->isSingleResult = true;
-        this->baseName = baseName;
-    }
-
-    void queueNextReader() {
-        // setup next chunk responder
-        // do this here to ensure we're in the active v8 scope
-        BufferedReadResponseBaton* res = new BufferedReadResponseBaton(parent, baseName + "-" + std::to_string(this->id), baseName, Nan::New(callback), this->id+1);
-        res->start();
-    }
-
-    v8::Local<v8::Function> getCallback() override { 
-        if(found) {
-           this->queueNextReader();
-        }
-
-        v8::Local<v8::Function> cb;
-
-        if(found) {
-            logVerbose("send-buffer");
-            isSingleResult = true;
-            cb = Nan::New(parent->onData);
-        } else {
-            logVerbose("send-done");
-            isSingleResult = false;
-            cb = Nan::New(parent->onDone);
-        }
-
-        return cb;
-    }
-
-    v8::Local<v8::Value> getReturnValue() override {
-        if(found) {
-            auto buf = Nan::CopyBuffer(buffer, length);
-            free(buffer);
-
-            return buf.ToLocalChecked();
-        } else {
-            
-            return Nan::False();
-        }
-    }
-
-    void run() override {
-        int ct = 0;
-        logVerbose("run");
+    for(;;) {
+        BufferItem* item = nullptr;
+        bool done = false;
 
         {
-            std::unique_lock<std::mutex> lck(parent->syncMutex);
-
-            while(parent->queue.empty() && parent->readThreadIsRunning) parent->signal.wait(lck);
-            if(parent->queue.empty()) {
-                logVerbose("queue-empty");
-                return;
+            std::unique_lock<std::mutex> lck(syncMutex);
+            if(!queue.empty()) {
+                item = queue.front();
+                queue.pop();
+            } else {
+                done = readerDone;
             }
-            
-            auto next = parent->queue.front();
-            buffer = next->buffer;
-            length = next->length;
-            found = true;
-
-            parent->queue.pop();
         }
 
-        logVerbose("took-queue-item");
+        if(item) {
+            auto buf = Nan::CopyBuffer(item->buffer, item->length);
+            free(item->buffer);
+            delete item;
+
+            v8::Local<v8::Value> argv[1] = { buf.ToLocalChecked() };
+            v8::Local<v8::Object> target = Nan::New<v8::Object>();
+            v8::Local<v8::Function> cb = Nan::New(onData);
+            runInAsyncScope(target, cb, 1, argv);
+        } else if(done) {
+            v8::Local<v8::Value> argv[2];
+
+            if(errorString[0]) {
+                argv[0] = v8::Exception::Error(Nan::New<v8::String>(errorString).ToLocalChecked());
+                argv[1] = Nan::Undefined();
+            } else {
+                argv[0] = Nan::Null();
+                argv[1] = Nan::False();
+            }
+
+            v8::Local<v8::Object> target = Nan::New<v8::Object>();
+            v8::Local<v8::Function> cb = Nan::New(onDone);
+            runInAsyncScope(target, cb, 2, argv);
+
+            uv_close(reinterpret_cast<uv_handle_t*>(&async), onAsyncClose);
+            return;
+        } else {
+            // queue empty but reader still running, wait for next signal
+            return;
+        }
     }
-};
+}
+
+void BufferedReadBaton::onAsyncClose(uv_handle_t* handle) {
+    auto baton = static_cast<BufferedReadBaton*>(
+        reinterpret_cast<uv_async_t*>(handle)->data
+    );
+    delete baton;
+}
 
 NAN_METHOD(BufferedRead)
 {
@@ -212,11 +181,11 @@ NAN_METHOD(BufferedRead)
     baton->onData.Reset(cb);
     baton->onDone.Reset(done);
     baton->readThreadIsRunning = true;
+    snprintf(baton->errorString, sizeof(baton->errorString), "");
 
-    BufferedReadResponseBaton* response = new BufferedReadResponseBaton(baton, "buffered-read-response-baton-INITIAL", "buffered-read-response-baton", cb, 1);
+    uv_async_init(Nan::GetCurrentEventLoop(), &baton->async, BufferedReadBaton::onAsync);
+    baton->async.data = baton;
 
     std::thread t1(reader, baton);
     t1.detach();
-
-    response->start();
 }

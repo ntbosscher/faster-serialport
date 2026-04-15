@@ -25,6 +25,7 @@
     "node": ">=8.6.0"
   },
   "scripts": {
+    "build": "prebuildify -t electron@40.8.1",
     "lint": "cc --verbose"
   },
   "publishConfig": {
