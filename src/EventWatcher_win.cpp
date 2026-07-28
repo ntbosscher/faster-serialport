@@ -159,10 +159,16 @@ void _eventWatcher(std::shared_ptr<DeviceWatcher> baton) {
   OVERLAPPED ov;
   bool pending = false;
 
+  // Create the event handle once and reuse it for every wait. Previously this
+  // was created inside the loop and never closed, leaking a kernel Event handle
+  // on every WaitCommEvent cycle.
+  HANDLE hEvent = CreateEvent(NULL,TRUE,FALSE,NULL);
+
   while(portIsActive(baton.get())) {
     if(!pending) {
       memset(&ov, 0, sizeof(ov));
-      ov.hEvent = CreateEvent(NULL,TRUE,FALSE,NULL);
+      ov.hEvent = hEvent;
+      ResetEvent(hEvent);
 
       if(!WaitCommEvent(file, &value, &ov)) {
         auto error = GetLastError();
@@ -170,6 +176,7 @@ void _eventWatcher(std::shared_ptr<DeviceWatcher> baton) {
 
           if(!portIsActive(baton.get())) {
             cleanup(verbose, "port is no longer active (after wait error)");
+            CloseHandle(hEvent);
             return;
           }
 
@@ -189,6 +196,7 @@ void _eventWatcher(std::shared_ptr<DeviceWatcher> baton) {
 
           if(error == ERROR_INVALID_HANDLE) {
             cleanup(verbose, "file handle is invalid");
+            CloseHandle(hEvent);
             return;
           }
 
@@ -206,13 +214,14 @@ void _eventWatcher(std::shared_ptr<DeviceWatcher> baton) {
 
       pending = false;
     }
-    
+
     auto result = _newEventWatcher(baton);
     result->Event = value;
     _eventWatcherEmit(std::move(result));
   }
 
   cleanup(verbose, "port is no longer active");
+  CloseHandle(hEvent);
 }
 
 std::unique_ptr<std::thread> EventWatcher(std::shared_ptr<DeviceWatcher> baton) {

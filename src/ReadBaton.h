@@ -11,8 +11,16 @@ public:
         request.data = this;
     }
 
+    // Release the pinned JS buffer. Runs on the main loop thread (via
+    // AfterAction) after the worker is done touching bufferData.
+    ~ReadBaton() override {
+        bufferRef.Reset();
+    }
+
     int fd = 0;
     int timeout = -1;
+    // Keeps the JS buffer alive so V8 can't free bufferData mid-read.
+    Nan::Persistent<v8::Object> bufferRef;
     char* bufferData = nullptr;
     size_t bufferLength = 0;
     size_t bytesRead = 0;

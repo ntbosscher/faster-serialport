@@ -13,6 +13,10 @@ using namespace Nan;
 struct Buffer {
     char* buffer;
     size_t length;
+    // The owning JS Buffer object. Callers running async work must pin this
+    // (via a Nan::Persistent) so V8 can't collect the backing store that
+    // `buffer` points into while a worker thread is still using it.
+    Local<Object> object;
 };
 
 class DecodeObject {

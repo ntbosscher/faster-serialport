@@ -13,6 +13,13 @@ struct DeviceWatcher {
   HANDLE file;
   std::thread thread;
   Nan::Persistent<v8::Function> eventsCallback;
+
+  ~DeviceWatcher() {
+    // Nan::Persistent uses NonCopyablePersistentTraits, which does NOT reset
+    // in its destructor. Without this the V8 global handle (and the JS callback
+    // it roots, plus its entire closure) leaks on every open().
+    eventsCallback.Reset();
+  }
 };
 
 struct PortInfo {

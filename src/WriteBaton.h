@@ -17,6 +17,12 @@ public:
         request.data = this;
     }
 
+    // Release the pinned JS buffer. Runs on the main loop thread (via
+    // AfterAction) after the worker is done touching bufferData.
+    ~WriteBaton() override {
+        buffer.Reset();
+    }
+
     int fd = 0;
     int timeout = -1;
     char *bufferData = nullptr;

@@ -166,6 +166,8 @@ NAN_METHOD(Write)
     baton->echoMode = echoMode;
     baton->bufferData = buffer.buffer;
     baton->bufferLength = buffer.length;
+    // Pin the JS buffer so V8 can't free bufferData while the worker writes it.
+    baton->buffer.Reset(buffer.object);
     baton->offset = 0;
     baton->complete = false;
 

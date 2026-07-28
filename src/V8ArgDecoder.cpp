@@ -122,6 +122,7 @@ Buffer V8ArgDecoder::takeBuffer() {
     v8::Local<v8::Object> buf = Nan::To<v8::Object>(value).ToLocalChecked();
     buffer.length = node::Buffer::Length(buf);
     buffer.buffer = node::Buffer::Data(buf);
+    buffer.object = buf;
 
     return buffer;
 }

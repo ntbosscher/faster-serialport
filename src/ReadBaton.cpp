@@ -2,6 +2,8 @@
 #include "./ReadBaton.h"
 #include "./V8ArgDecoder.h"
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 v8::Local<v8::Value> ReadBaton::getReturnValue()
 {
@@ -34,6 +36,8 @@ NAN_METHOD(Read)
         baton->bytesToRead = bytesToRead;
         baton->bufferLength = buffer.length;
         baton->bufferData = buffer.buffer;
+        // Pin the JS buffer so V8 can't free bufferData while the worker reads into it.
+        baton->bufferRef.Reset(buffer.object);
         baton->timeout = timeout;
         baton->complete = false;
 
@@ -43,13 +47,15 @@ NAN_METHOD(Read)
 void ReadBaton::run()
 {
 
-    int start = currentMs();
-    int deadline = start + this->timeout;
+    // Use a wall-clock (steady) deadline. currentMs() is derived from clock(),
+    // which measures CPU time, not elapsed time, so it can't be used to bound a
+    // read that spends its time waiting on the device.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(this->timeout);
 
     if(verbose) {
         muLogger.lock();
         auto out = defaultLogger();
-        out << currentMs() << " " << debugName << " expecting=" << bytesToRead << " have=" << bytesRead << " blocking=" << true << " \n";
+        out << currentMs() << " " << debugName << " expecting=" << bytesToRead << " have=" << bytesRead << " blocking=" << false << " \n";
         out.close();
         muLogger.unlock();
     }
@@ -58,10 +64,19 @@ void ReadBaton::run()
     {
         char *buffer = bufferData + offset;
 
-        auto bytesTransferred = readFromSerial(fd, buffer, bytesToRead, true, errorString);
+        // Non-blocking read: a blocking read() ignores the deadline entirely and
+        // hangs forever when the device goes quiet, pinning a libuv threadpool
+        // thread and leaking this baton (and every read queued behind it).
+        auto bytesTransferred = readFromSerial(fd, buffer, bytesToRead, false, errorString);
         if(bytesTransferred < 0) {
             complete = true;
             break;
+        }
+
+        if(bytesTransferred == 0) {
+            // no data ready yet; wait briefly, then re-check the deadline
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
 
         bytesToRead -= bytesTransferred;
@@ -69,7 +84,7 @@ void ReadBaton::run()
         offset += bytesTransferred;
         complete = bytesToRead == 0;
 
-    } while (!complete && currentMs() < deadline);
+    } while (!complete && std::chrono::steady_clock::now() < deadline);
 
     if(verbose) {
         muLogger.lock();
