@@ -6,10 +6,16 @@ package main
 // fsp_emit_chunk is implemented on the C++ (node-addon-api) side. The Go
 // bufferedRead loop calls it once per chunk of received data. The C++ side must
 // copy the bytes before returning; Go reuses the underlying buffer afterwards.
+//
+// fsp_complete is also implemented on the C++ side. Each fsp_*_async wrapper
+// calls it exactly once to report its result: err is non-NULL on failure,
+// resultJSON holds the JSON-encoded success value (or NULL when the operation
+// has no result). The C++ side takes ownership of both strings and frees them.
 #ifdef __cplusplus
 extern "C" {
 #endif
 extern void fsp_emit_chunk(int cbId, void* data, int len);
+extern void fsp_complete(int cbId, char* err, char* resultJson);
 #ifdef __cplusplus
 }
 #endif
@@ -22,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -113,15 +120,18 @@ func fsp_configure_logging(enabled C.int, dir *C.char) {
 		logEnabled = false
 		return
 	}
+
 	logFile = f
 }
 
 func logf(format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
+
 	if !logEnabled || logFile == nil {
 		return
 	}
+
 	fmt.Fprintf(logFile, time.Now().Format("15:04:05.000")+" "+format+"\n", args...)
 }
 
@@ -556,6 +566,100 @@ func fsp_flush(id C.longlong) *C.char {
 		return cErr(err)
 	}
 	return cErr(h.port.ResetOutputBuffer())
+}
+
+// ---- async dispatch ------------------------------------------------------
+//
+// The node-addon-api layer calls these instead of the synchronous fsp_*
+// functions. Each runs the operation and reports the outcome through
+// fsp_complete. The work still runs synchronously on the calling thread; a
+// later step will move it onto a goroutine so the caller returns immediately.
+
+func completeErr(cbID C.int, err *C.char) {
+	C.fsp_complete(cbID, err, nil)
+}
+
+// completeNum reports a numeric success value (encoded as JSON so the C++ side
+// can parse it into a JS number). On error the value is dropped.
+func completeNum(cbID C.int, err *C.char, n int64) {
+	if err != nil {
+		C.fsp_complete(cbID, err, nil)
+		return
+	}
+	C.fsp_complete(cbID, nil, C.CString(strconv.FormatInt(n, 10)))
+}
+
+//export fsp_list_async
+func fsp_list_async(cbID C.int) {
+	var out *C.char
+	err := fsp_list(&out)
+	C.fsp_complete(cbID, err, out)
+}
+
+//export fsp_open_async
+func fsp_open_async(path *C.char, optsJSON *C.char, cbID C.int) {
+	var h C.longlong
+	err := fsp_open(path, optsJSON, &h)
+	completeNum(cbID, err, int64(h))
+}
+
+//export fsp_close_async
+func fsp_close_async(id C.longlong, cbID C.int) {
+	completeErr(cbID, fsp_close(id))
+}
+
+//export fsp_read_async
+func fsp_read_async(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, cbID C.int) {
+	var n C.int
+	err := fsp_read(id, buf, length, timeoutMs, &n)
+	completeNum(cbID, err, int64(n))
+}
+
+//export fsp_write_async
+func fsp_write_async(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, echoMode C.int, cbID C.int) {
+	completeErr(cbID, fsp_write(id, buf, length, timeoutMs, echoMode))
+}
+
+//export fsp_update_async
+func fsp_update_async(id C.longlong, optsJSON *C.char, cbID C.int) {
+	completeErr(cbID, fsp_update(id, optsJSON))
+}
+
+//export fsp_set_async
+func fsp_set_async(id C.longlong, optsJSON *C.char, cbID C.int) {
+	completeErr(cbID, fsp_set(id, optsJSON))
+}
+
+//export fsp_get_async
+func fsp_get_async(id C.longlong, cbID C.int) {
+	var out *C.char
+	err := fsp_get(id, &out)
+	C.fsp_complete(cbID, err, out)
+}
+
+//export fsp_get_baud_rate_async
+func fsp_get_baud_rate_async(id C.longlong, cbID C.int) {
+	var b C.int
+	err := fsp_get_baud_rate(id, &b)
+	completeNum(cbID, err, int64(b))
+}
+
+//export fsp_drain_async
+func fsp_drain_async(id C.longlong, cbID C.int) {
+	completeErr(cbID, fsp_drain(id))
+}
+
+//export fsp_flush_async
+func fsp_flush_async(id C.longlong, cbID C.int) {
+	completeErr(cbID, fsp_flush(id))
+}
+
+// fsp_buffered_read_async streams chunks to dataCbID (via fsp_emit_chunk inside
+// fsp_buffered_read) and reports the loop's exit to doneCbID.
+//
+//export fsp_buffered_read_async
+func fsp_buffered_read_async(id C.longlong, noDataTimeoutMs C.int, dataCbID C.int, doneCbID C.int) {
+	completeErr(doneCbID, fsp_buffered_read(id, noDataTimeoutMs, dataCbID))
 }
 
 func main() {}

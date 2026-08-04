@@ -1,7 +1,13 @@
 // node-addon-api bridge between lib/bindings.js and the Go c-archive
-// (go-serial). Every async binding function runs its blocking Go call on a
-// libuv worker thread via Napi::AsyncWorker and reports back through the
-// callback-last contract that lib/bindings.js expects: cb(err, result).
+// (go-serial). One-shot binding functions dispatch straight into the Go
+// c-archive (fsp_*_async) and return immediately; Go reports the result back
+// through fsp_complete, which resolves the JS promise on the loop thread via a
+// per-call Napi::ThreadSafeFunction. The callback-last contract that
+// lib/bindings.js expects is preserved: cb(err, result).
+//
+// bufferedRead follows the same dispatch: it runs synchronously in Go and
+// reports completion through fsp_complete, but additionally streams received
+// chunks up through a separate ThreadSafeFunction (fsp_emit_chunk) while it runs.
 
 #include <napi.h>
 
@@ -13,17 +19,6 @@
 #include "libserial.h"
 
 namespace {
-
-// takeGoError consumes a char* returned by a Go export: it copies the message
-// (if any) into `out` and frees the Go-allocated string. Returns true on error.
-bool takeGoError(char* err, std::string& out) {
-  if (err == nullptr) {
-    return false;
-  }
-  out = err;
-  fsp_free(err);
-  return true;
-}
 
 std::string jsonStringify(Napi::Env env, Napi::Value value) {
   Napi::Object json = env.Global().Get("JSON").As<Napi::Object>();
@@ -39,6 +34,56 @@ Napi::Value jsonParse(Napi::Env env, const std::string& text) {
   Napi::Object json = env.Global().Get("JSON").As<Napi::Object>();
   Napi::Function parse = json.Get("parse").As<Napi::Function>();
   return parse.Call(json, {Napi::String::New(env, text)});
+}
+
+// ---- async completion plumbing -------------------------------------------
+//
+// A PendingOp holds everything needed to resolve one in-flight operation: the
+// per-call ThreadSafeFunction wrapping the JS callback, an optional buffer
+// reference kept alive while Go reads/writes it, and the result filled in by
+// fsp_complete.
+
+struct PendingOp {
+  Napi::ThreadSafeFunction tsfn;
+  Napi::Reference<Napi::Buffer<char>> bufferRef;
+  std::string err;
+  std::string result;  // JSON-encoded success value
+  bool isError = false;
+  bool hasResult = false;
+  int streamCbId = 0;  // bufferedRead's streaming TSFN, released on completion
+};
+
+std::mutex g_pending_mu;
+std::map<int, PendingOp*> g_pending;
+int g_next_pending_id = 1;
+
+int registerPending(Napi::ThreadSafeFunction tsfn,
+                    Napi::Reference<Napi::Buffer<char>> bufferRef,
+                    int streamCbId = 0) {
+  auto* op = new PendingOp();
+  op->tsfn = tsfn;
+  op->bufferRef = std::move(bufferRef);
+  op->streamCbId = streamCbId;
+
+  std::lock_guard<std::mutex> lock(g_pending_mu);
+  int id = g_next_pending_id++;
+  g_pending[id] = op;
+  return id;
+}
+
+// makeCbId wires the JS completion callback to a fresh pending slot and returns
+// its id for handing to the Go *_async call.
+int makeCbId(Napi::Env env, Napi::Function cb, const char* name) {
+  auto tsfn = Napi::ThreadSafeFunction::New(env, cb, name, 0, 1);
+  return registerPending(tsfn, Napi::Reference<Napi::Buffer<char>>());
+}
+
+// buf is held alive (via a persistent reference) until the operation completes,
+// so Go can safely read from / write into its memory.
+int makeCbId(Napi::Env env, Napi::Function cb, const char* name,
+             Napi::Buffer<char> buf) {
+  auto tsfn = Napi::ThreadSafeFunction::New(env, cb, name, 0, 1);
+  return registerPending(tsfn, Napi::Persistent(buf));
 }
 
 // ---- bufferedRead chunk plumbing -----------------------------------------
@@ -72,247 +117,6 @@ void releaseTsfn(int id) {
   tsfn.Release();
 }
 
-// ---- workers -------------------------------------------------------------
-
-class ListWorker : public Napi::AsyncWorker {
- public:
-  ListWorker(const Napi::Function& cb) : Napi::AsyncWorker(cb) {}
-
-  void Execute() override {
-    char* json = nullptr;
-    std::string err;
-    if (takeGoError(fsp_list(&json), err)) {
-      SetError(err);
-      return;
-    }
-    if (json != nullptr) {
-      json_ = json;
-      fsp_free(json);
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Callback().Call({env.Null(), jsonParse(env, json_)});
-  }
-
- private:
-  std::string json_;
-};
-
-class OpenWorker : public Napi::AsyncWorker {
- public:
-  OpenWorker(const Napi::Function& cb, std::string path, std::string opts)
-      : Napi::AsyncWorker(cb), path_(std::move(path)), opts_(std::move(opts)) {}
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_open(&path_[0], &opts_[0], &handle_), err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Callback().Call(
-        {env.Null(), Napi::Number::New(env, static_cast<double>(handle_))});
-  }
-
- private:
-  std::string path_;
-  std::string opts_;
-  long long handle_ = 0;
-};
-
-class CloseWorker : public Napi::AsyncWorker {
- public:
-  CloseWorker(const Napi::Function& cb, long long handle)
-      : Napi::AsyncWorker(cb), handle_(handle) {}
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_close(handle_), err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override { Callback().Call({Env().Null()}); }
-
- private:
-  long long handle_;
-};
-
-class ReadWorker : public Napi::AsyncWorker {
- public:
-  ReadWorker(const Napi::Function& cb, long long handle, Napi::Buffer<char> buf,
-             int offset, int length, int timeout)
-      : Napi::AsyncWorker(cb),
-        handle_(handle),
-        data_(buf.Data() + offset),
-        length_(length),
-        timeout_(timeout) {
-    bufferRef_ = Napi::Persistent(buf);
-  }
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_read(handle_, data_, length_, timeout_, &bytesRead_),
-                    err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Callback().Call({env.Null(), Napi::Number::New(env, bytesRead_)});
-  }
-
- private:
-  long long handle_;
-  char* data_;
-  int length_;
-  int timeout_;
-  int bytesRead_ = 0;
-  Napi::Reference<Napi::Buffer<char>> bufferRef_;
-};
-
-class WriteWorker : public Napi::AsyncWorker {
- public:
-  WriteWorker(const Napi::Function& cb, long long handle,
-              Napi::Buffer<char> buf, int timeout, int echoMode)
-      : Napi::AsyncWorker(cb),
-        handle_(handle),
-        data_(buf.Data()),
-        length_(static_cast<int>(buf.Length())),
-        timeout_(timeout),
-        echoMode_(echoMode) {
-    bufferRef_ = Napi::Persistent(buf);
-  }
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_write(handle_, data_, length_, timeout_, echoMode_),
-                    err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override { Callback().Call({Env().Null()}); }
-
- private:
-  long long handle_;
-  char* data_;
-  int length_;
-  int timeout_;
-  int echoMode_;
-  Napi::Reference<Napi::Buffer<char>> bufferRef_;
-};
-
-class BufferedReadWorker : public Napi::AsyncWorker {
- public:
-  BufferedReadWorker(const Napi::Function& cb, long long handle, int timeout,
-                     int cbId)
-      : Napi::AsyncWorker(cb),
-        handle_(handle),
-        timeout_(timeout),
-        cbId_(cbId) {}
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_buffered_read(handle_, timeout_, cbId_), err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override {
-    releaseTsfn(cbId_);
-    Napi::Env env = Env();
-    Callback().Call({env.Null(), Napi::Boolean::New(env, false)});
-  }
-
-  void OnError(const Napi::Error& e) override {
-    releaseTsfn(cbId_);
-    Callback().Call({e.Value()});
-  }
-
- private:
-  long long handle_;
-  int timeout_;
-  int cbId_;
-};
-
-// SimpleWorker covers the handle-only ops whose success result is null:
-// update, set, drain, flush.
-class SimpleWorker : public Napi::AsyncWorker {
- public:
-  using Fn = std::function<char*()>;
-
-  SimpleWorker(const Napi::Function& cb, Fn fn)
-      : Napi::AsyncWorker(cb), fn_(std::move(fn)) {}
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fn_(), err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override { Callback().Call({Env().Null()}); }
-
- private:
-  Fn fn_;
-};
-
-class GetWorker : public Napi::AsyncWorker {
- public:
-  GetWorker(const Napi::Function& cb, long long handle)
-      : Napi::AsyncWorker(cb), handle_(handle) {}
-
-  void Execute() override {
-    char* json = nullptr;
-    std::string err;
-    if (takeGoError(fsp_get(handle_, &json), err)) {
-      SetError(err);
-      return;
-    }
-    if (json != nullptr) {
-      json_ = json;
-      fsp_free(json);
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Callback().Call({env.Null(), jsonParse(env, json_)});
-  }
-
- private:
-  long long handle_;
-  std::string json_;
-};
-
-class GetBaudRateWorker : public Napi::AsyncWorker {
- public:
-  GetBaudRateWorker(const Napi::Function& cb, long long handle)
-      : Napi::AsyncWorker(cb), handle_(handle) {}
-
-  void Execute() override {
-    std::string err;
-    if (takeGoError(fsp_get_baud_rate(handle_, &baud_), err)) {
-      SetError(err);
-    }
-  }
-
-  void OnOK() override {
-    Napi::Env env = Env();
-    Callback().Call({env.Null(), Napi::Number::New(env, baud_)});
-  }
-
- private:
-  long long handle_;
-  int baud_ = 0;
-};
-
 // ---- JS-facing functions -------------------------------------------------
 
 long long asHandle(Napi::Value v) {
@@ -320,45 +124,50 @@ long long asHandle(Napi::Value v) {
 }
 
 Napi::Value List(const Napi::CallbackInfo& info) {
-  auto cb = info[0].As<Napi::Function>();
-  (new ListWorker(cb))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[0].As<Napi::Function>(), "fsp_list");
+  fsp_list_async(cbId);
+  return env.Undefined();
 }
 
 Napi::Value Open(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   std::string path = info[0].As<Napi::String>();
   std::string opts = jsonStringify(env, info[1]);
-  auto cb = info[2].As<Napi::Function>();
-  (new OpenWorker(cb, std::move(path), std::move(opts)))->Queue();
+  int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_open");
+  fsp_open_async(&path[0], &opts[0], cbId);
   return env.Undefined();
 }
 
 Napi::Value Close(const Napi::CallbackInfo& info) {
-  auto cb = info[1].As<Napi::Function>();
-  (new CloseWorker(cb, asHandle(info[0])))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_close");
+  fsp_close_async(asHandle(info[0]), cbId);
+  return env.Undefined();
 }
 
 Napi::Value Read(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
   long long handle = asHandle(info[0]);
   auto buffer = info[1].As<Napi::Buffer<char>>();
   int offset = info[2].As<Napi::Number>().Int32Value();
   int length = info[3].As<Napi::Number>().Int32Value();
   int timeout = info[4].As<Napi::Number>().Int32Value();
-  auto cb = info[5].As<Napi::Function>();
-  (new ReadWorker(cb, handle, buffer, offset, length, timeout))->Queue();
-  return info.Env().Undefined();
+  int cbId = makeCbId(env, info[5].As<Napi::Function>(), "fsp_read", buffer);
+  fsp_read_async(handle, buffer.Data() + offset, length, timeout, cbId);
+  return env.Undefined();
 }
 
 Napi::Value Write(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
   long long handle = asHandle(info[0]);
   auto buffer = info[1].As<Napi::Buffer<char>>();
   int timeout = info[2].As<Napi::Number>().Int32Value();
   int echoMode = info[3].As<Napi::Boolean>().Value() ? 1 : 0;
-  auto cb = info[4].As<Napi::Function>();
-  (new WriteWorker(cb, handle, buffer, timeout, echoMode))->Queue();
-  return info.Env().Undefined();
+  int cbId = makeCbId(env, info[4].As<Napi::Function>(), "fsp_write", buffer);
+  fsp_write_async(handle, buffer.Data(), static_cast<int>(buffer.Length()),
+                  timeout, echoMode, cbId);
+  return env.Undefined();
 }
 
 Napi::Value BufferedRead(const Napi::CallbackInfo& info) {
@@ -368,10 +177,20 @@ Napi::Value BufferedRead(const Napi::CallbackInfo& info) {
   auto dataCb = info[2].As<Napi::Function>();
   auto doneCb = info[3].As<Napi::Function>();
 
-  auto tsfn = Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read", 0,
-                                            1);
-  int cbId = registerTsfn(tsfn);
-  (new BufferedReadWorker(doneCb, handle, timeout, cbId))->Queue();
+  // Streaming callback for received chunks. Created before the done slot so its
+  // queued chunks are processed ahead of the done resolution.
+  auto dataTsfn =
+      Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read", 0, 1);
+  int dataCbId = registerTsfn(dataTsfn);
+
+  // Done callback resolves via fsp_complete, which also releases the streaming
+  // callback (dataCbId) once its queued chunks have drained.
+  auto doneTsfn = Napi::ThreadSafeFunction::New(env, doneCb,
+                                                "fsp_buffered_read_done", 0, 1);
+  int doneCbId =
+      registerPending(doneTsfn, Napi::Reference<Napi::Buffer<char>>(), dataCbId);
+
+  fsp_buffered_read_async(handle, timeout, dataCbId, doneCbId);
   return env.Undefined();
 }
 
@@ -379,10 +198,8 @@ Napi::Value Update(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   long long handle = asHandle(info[0]);
   std::string opts = jsonStringify(env, info[1]);
-  auto cb = info[2].As<Napi::Function>();
-  (new SimpleWorker(cb, [handle, opts]() mutable {
-    return fsp_update(handle, &opts[0]);
-  }))->Queue();
+  int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_update");
+  fsp_update_async(handle, &opts[0], cbId);
   return env.Undefined();
 }
 
@@ -390,37 +207,37 @@ Napi::Value Set(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   long long handle = asHandle(info[0]);
   std::string opts = jsonStringify(env, info[1]);
-  auto cb = info[2].As<Napi::Function>();
-  (new SimpleWorker(cb, [handle, opts]() mutable {
-    return fsp_set(handle, &opts[0]);
-  }))->Queue();
+  int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_set");
+  fsp_set_async(handle, &opts[0], cbId);
   return env.Undefined();
 }
 
 Napi::Value Get(const Napi::CallbackInfo& info) {
-  auto cb = info[1].As<Napi::Function>();
-  (new GetWorker(cb, asHandle(info[0])))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_get");
+  fsp_get_async(asHandle(info[0]), cbId);
+  return env.Undefined();
 }
 
 Napi::Value GetBaudRate(const Napi::CallbackInfo& info) {
-  auto cb = info[1].As<Napi::Function>();
-  (new GetBaudRateWorker(cb, asHandle(info[0])))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_get_baud_rate");
+  fsp_get_baud_rate_async(asHandle(info[0]), cbId);
+  return env.Undefined();
 }
 
 Napi::Value Drain(const Napi::CallbackInfo& info) {
-  long long handle = asHandle(info[0]);
-  auto cb = info[1].As<Napi::Function>();
-  (new SimpleWorker(cb, [handle]() { return fsp_drain(handle); }))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_drain");
+  fsp_drain_async(asHandle(info[0]), cbId);
+  return env.Undefined();
 }
 
 Napi::Value Flush(const Napi::CallbackInfo& info) {
-  long long handle = asHandle(info[0]);
-  auto cb = info[1].As<Napi::Function>();
-  (new SimpleWorker(cb, [handle]() { return fsp_flush(handle); }))->Queue();
-  return info.Env().Undefined();
+  Napi::Env env = info.Env();
+  int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_flush");
+  fsp_flush_async(asHandle(info[0]), cbId);
+  return env.Undefined();
 }
 
 Napi::Value ConfigureLogging(const Napi::CallbackInfo& info) {
@@ -450,9 +267,71 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
 }  // namespace
 
-// fsp_emit_chunk is called from the Go bufferedRead loop (on the worker thread)
-// once per received chunk. It copies the bytes and hands them to the JS data
-// callback registered under cbId.
+// fsp_complete is called from a Go fsp_*_async wrapper to report an operation's
+// outcome. It resolves the JS promise for cbId via that call's ThreadSafeFunction
+// (NonBlockingCall so it can't deadlock when invoked on the loop thread). It
+// takes ownership of the err / resultJson strings and frees them.
+extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
+  PendingOp* op = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_pending_mu);
+    auto it = g_pending.find(cbId);
+    if (it != g_pending.end()) {
+      op = it->second;
+      g_pending.erase(it);
+    }
+  }
+
+  if (op == nullptr) {
+    // Unknown id: free the Go-allocated strings so they don't leak.
+    if (err != nullptr) {
+      fsp_free(err);
+    }
+    if (resultJson != nullptr) {
+      fsp_free(resultJson);
+    }
+    return;
+  }
+
+  if (err != nullptr) {
+    op->err = err;
+    op->isError = true;
+    fsp_free(err);
+  }
+  if (resultJson != nullptr) {
+    op->result = resultJson;
+    op->hasResult = true;
+    fsp_free(resultJson);
+  }
+
+  Napi::ThreadSafeFunction tsfn = op->tsfn;
+  napi_status status = tsfn.NonBlockingCall(
+      op, [](Napi::Env env, Napi::Function cb, PendingOp* op) {
+        if (op->isError) {
+          cb.Call({Napi::Error::New(env, op->err).Value()});
+        } else if (op->hasResult) {
+          cb.Call({env.Null(), jsonParse(env, op->result)});
+        } else {
+          cb.Call({env.Null()});
+        }
+        // bufferedRead: release its streaming callback now that all queued
+        // chunks (processed ahead of this done resolution) have drained.
+        if (op->streamCbId != 0) {
+          releaseTsfn(op->streamCbId);
+        }
+        delete op;  // releases bufferRef on the loop thread
+      });
+
+  if (status != napi_ok) {
+    delete op;
+  }
+  tsfn.Release();
+}
+
+// fsp_emit_chunk is called from the Go bufferedRead loop (on the calling thread)
+// once per received chunk. It copies the bytes and enqueues them for the JS data
+// callback registered under cbId. NonBlockingCall so it can't deadlock when the
+// Go loop runs on the loop thread.
 extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
   Napi::ThreadSafeFunction tsfn;
   {
@@ -468,7 +347,7 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
   chunk->bytes.assign(static_cast<char*>(data),
                       static_cast<char*>(data) + len);
 
-  napi_status status = tsfn.BlockingCall(
+  napi_status status = tsfn.NonBlockingCall(
       chunk, [](Napi::Env env, Napi::Function jsCallback, Chunk* c) {
         Napi::Buffer<char> buf =
             Napi::Buffer<char>::Copy(env, c->bytes.data(), c->bytes.size());
