@@ -236,36 +236,45 @@ func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
 	batch := sink.newBatch(opts.batchSize)
 	filled := 0
 
+	// Free the current batch on every exit path, including a panic in a port op
+	// (autoRecover reports it upstream). flush clears batch to nil across the
+	// ownership handoff, so an emit/alloc panic can't double-free a buffer whose
+	// ownership has already transferred to the consumer.
+	defer func() {
+		if batch != nil {
+			sink.free(batch)
+		}
+	}()
+
 	flush := func() {
 		if filled == 0 {
 			return
 		}
-		sink.emit(batch, filled)
-		batch = sink.newBatch(opts.batchSize)
+		b := batch
+		n := filled
+		batch = nil // relinquish our claim before the handoff
 		filled = 0
-	}
-
-	// done flushes any pending data, then releases the trailing (empty) batch.
-	done := func(err error) error {
-		flush()
-		sink.free(batch)
-		return err
+		sink.emit(b, n) // ownership of b transfers to the consumer
+		batch = sink.newBatch(opts.batchSize)
 	}
 
 	idleDeadline := time.Now().Add(opts.noDataTimeout)
 
 	for {
 		if time.Now().After(idleDeadline) {
-			return done(nil)
+			flush()
+			return nil
 		}
 
 		if err := p.port.SetReadTimeout(opts.pollTimeout); err != nil {
-			return done(err)
+			flush()
+			return err
 		}
 
 		n, err := p.port.Read(batch[filled:])
 		if err != nil {
-			return done(err)
+			flush()
+			return err
 		}
 
 		if n == 0 {

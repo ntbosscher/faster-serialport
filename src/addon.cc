@@ -356,6 +356,11 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
       });
 
   if (status != napi_ok) {
+    // The callback won't run, so release bufferedRead's streaming TSFN here
+    // instead (it is otherwise released from inside that callback).
+    if (op->streamCbId != 0) {
+      releaseTsfn(op->streamCbId);
+    }
     delete op;
   }
   tsfn.Release();
