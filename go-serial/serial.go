@@ -1,40 +1,12 @@
 package main
 
-/*
-#include <stdlib.h>
-
-// fsp_emit_chunk is implemented on the C++ (node-addon-api) side. The Go
-// bufferedRead loop calls it once per chunk of received data. The C++ side must
-// copy the bytes before returning; Go reuses the underlying buffer afterwards.
-//
-// fsp_complete is also implemented on the C++ side. Each fsp_*_async wrapper
-// calls it exactly once to report its result: err is non-NULL on failure,
-// resultJSON holds the JSON-encoded success value (or NULL when the operation
-// has no result). The C++ side takes ownership of both strings and frees them.
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern void fsp_emit_chunk(int cbId, void* data, int len);
-extern void fsp_complete(int cbId, char* err, char* resultJson);
-#ifdef __cplusplus
-}
-#endif
-*/
-import "C"
-
 import (
-	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"sync"
 	"time"
-	"unsafe"
 
 	"go.bug.st/serial"
-	"go.bug.st/serial/enumerator"
 )
 
 // portHandle holds an open port plus the mode it was opened with, so update()
@@ -42,309 +14,139 @@ import (
 type portHandle struct {
 	port serial.Port
 	mode *serial.Mode
+
+	readConch  chan struct{}
+	writeConch chan struct{}
 }
 
-var (
-	handlesMu  sync.RWMutex
-	handles    = map[int64]*portHandle{}
-	nextHandle int64
-)
+func newPortHandle(port serial.Port, mode *serial.Mode) *portHandle {
+	h := &portHandle{
+		port:       port,
+		mode:       mode,
+		readConch:  make(chan struct{}, 1),
+		writeConch: make(chan struct{}, 1),
+	}
 
-func storeHandle(h *portHandle) int64 {
-	handlesMu.Lock()
-	defer handlesMu.Unlock()
-	nextHandle++
-	id := nextHandle
-	handles[id] = h
-	return id
-}
-
-func getHandle(id int64) *portHandle {
-	handlesMu.RLock()
-	defer handlesMu.RUnlock()
-	return handles[id]
-}
-
-func removeHandle(id int64) *portHandle {
-	handlesMu.Lock()
-	defer handlesMu.Unlock()
-	h := handles[id]
-	delete(handles, id)
+	// Seed each conch with a token so the first acquire succeeds. Taking the
+	// token holds the conch; returning it releases it.
+	h.readConch <- struct{}{}
+	h.writeConch <- struct{}{}
 	return h
 }
 
-// cErr converts a Go error into a malloc'd C string (freed by the C++ side via
-// fsp_free). A nil error yields a NULL pointer, which signals success.
-func cErr(err error) *C.char {
-	if err == nil {
+var errIOTimeout = errors.New("i/o operation timed out")
+
+// acquire takes conch, giving up with a timeout error if it isn't free before
+// deadline.
+func acquire(conch chan struct{}, deadline time.Time) error {
+	ctx, cancel := context.WithDeadlineCause(context.Background(), deadline, errIOTimeout)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-conch:
 		return nil
 	}
-	return C.CString(err.Error())
 }
 
-func cErrf(format string, args ...any) *C.char {
-	return C.CString(fmt.Sprintf(format, args...))
+func (p *portHandle) Close() error {
+	// close is special and doesn't require locking "conch"
+	return p.port.Close()
 }
 
-//export fsp_free
-func fsp_free(p unsafe.Pointer) {
-	C.free(p)
-}
-
-// ---- logging -------------------------------------------------------------
-
-var (
-	logMu      sync.Mutex
-	logEnabled bool
-	logFile    *os.File
-)
-
-//export fsp_configure_logging
-func fsp_configure_logging(enabled C.int, dir *C.char) {
-	logMu.Lock()
-	defer logMu.Unlock()
-
-	if logFile != nil {
-		logFile.Close()
-		logFile = nil
-	}
-
-	logEnabled = enabled != 0
-	if !logEnabled {
-		return
-	}
-
-	path := filepath.Join(C.GoString(dir), "faster-serialport-go.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		logEnabled = false
-		return
-	}
-
-	logFile = f
-}
-
-func logf(format string, args ...any) {
-	logMu.Lock()
-	defer logMu.Unlock()
-
-	if !logEnabled || logFile == nil {
-		return
-	}
-
-	fmt.Fprintf(logFile, time.Now().Format("15:04:05.000")+" "+format+"\n", args...)
-}
-
-// ---- list ----------------------------------------------------------------
-
-type portInfo struct {
-	Path         string `json:"path"`
-	Manufacturer string `json:"manufacturer,omitempty"`
-	SerialNumber string `json:"serialNumber,omitempty"`
-	VendorID     string `json:"vendorId,omitempty"`
-	ProductID    string `json:"productId,omitempty"`
-}
-
-//export fsp_list
-func fsp_list(outJSON **C.char) *C.char {
-	ports, err := enumerator.GetDetailedPortsList()
-	if err != nil {
-		return cErr(err)
-	}
-
-	list := []portInfo{}
-	for _, p := range ports {
-		item := portInfo{Path: p.Name}
-		if p.IsUSB {
-			item.Manufacturer = p.Manufacturer
-			item.SerialNumber = p.SerialNumber
-			item.VendorID = p.VID
-			item.ProductID = p.PID
-		}
-		list = append(list, item)
-	}
-
-	data, err := json.Marshal(list)
-	if err != nil {
-		return cErr(err)
-	}
-
-	*outJSON = C.CString(string(data))
-	return nil
-}
-
-// ---- open ----------------------------------------------------------------
-
-type openOpts struct {
-	BaudRate int     `json:"baudRate"`
-	DataBits int     `json:"dataBits"`
-	Parity   string  `json:"parity"`
-	StopBits float64 `json:"stopBits"`
-}
-
-func modeFromOpts(o openOpts) (*serial.Mode, *C.char) {
-	mode := &serial.Mode{
-		BaudRate: o.BaudRate,
-		DataBits: o.DataBits,
-	}
-
-	if mode.BaudRate == 0 {
-		mode.BaudRate = 9600
-	}
-	if mode.DataBits == 0 {
-		mode.DataBits = 8
-	}
-
-	switch o.Parity {
-	case "", "none":
-		mode.Parity = serial.NoParity
-	case "odd":
-		mode.Parity = serial.OddParity
-	case "even":
-		mode.Parity = serial.EvenParity
-	case "mark":
-		mode.Parity = serial.MarkParity
-	case "space":
-		mode.Parity = serial.SpaceParity
-	default:
-		return nil, cErrf("invalid parity setting %q", o.Parity)
-	}
-
-	switch o.StopBits {
-	case 0, 1:
-		mode.StopBits = serial.OneStopBit
-	case 1.5:
-		mode.StopBits = serial.OnePointFiveStopBits
-	case 2:
-		mode.StopBits = serial.TwoStopBits
-	default:
-		return nil, cErrf("invalid stop bits setting %v", o.StopBits)
-	}
-
-	return mode, nil
-}
-
-//export fsp_open
-func fsp_open(path *C.char, optsJSON *C.char, outHandle *C.longlong) *C.char {
-	opts := openOpts{}
-	if err := json.Unmarshal([]byte(C.GoString(optsJSON)), &opts); err != nil {
-		return cErr(err)
-	}
-
-	mode, cerr := modeFromOpts(opts)
-	if cerr != nil {
-		return cerr
-	}
-
-	name := C.GoString(path)
-	port, err := serial.Open(name, mode)
-	if err != nil {
-		logf("open %s failed: %v", name, err)
-		return cErr(err)
-	}
-
-	id := storeHandle(&portHandle{port: port, mode: mode})
-	logf("open %s -> handle %d", name, id)
-	*outHandle = C.longlong(id)
-	return nil
-}
-
-//export fsp_close
-func fsp_close(id C.longlong) *C.char {
-	h := removeHandle(int64(id))
-	if h == nil {
-		return nil
-	}
-	logf("close handle %d", int64(id))
-	return cErr(h.port.Close())
-}
-
-// ---- read ----------------------------------------------------------------
-
-// fsp_read fills up to length bytes (or until timeoutMs elapses) into the
-// caller-owned buffer. It returns however many bytes were read; a timeout is
-// not an error and yields a partial (possibly zero) count.
-//
-//export fsp_read
-func fsp_read(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, outN *C.int) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
-
-	dst := unsafe.Slice((*byte)(buf), int(length))
+// Read fills up to len(dst) bytes (or until timeoutMs elapses) and returns the
+// number of bytes read; a timeout is not an error and yields a partial
+// (possibly zero) count.
+func (p *portHandle) Read(dst []byte, timeoutMs int64) (int64, error) {
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 
+	if err := acquire(p.readConch, deadline); err != nil {
+		return 0, err
+	}
+	defer func() { p.readConch <- struct{}{} }()
+
 	received := 0
+
 	for received < len(dst) {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
-		if err := h.port.SetReadTimeout(remaining); err != nil {
-			*outN = C.int(received)
-			return cErr(err)
+
+		if err := p.port.SetReadTimeout(remaining); err != nil {
+			return 0, err
 		}
 
-		n, err := h.port.Read(dst[received:])
+		n, err := p.port.Read(dst[received:])
+
 		received += n
 		if err != nil {
-			*outN = C.int(received)
-			return cErr(err)
+			return 0, err
 		}
+
 		if n == 0 {
 			// read timed out with no data
 			break
 		}
 	}
 
-	*outN = C.int(received)
-	return nil
+	return int64(received), nil
 }
 
-// ---- write ---------------------------------------------------------------
-
-//export fsp_write
-func fsp_write(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, echoMode C.int) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
-
-	data := unsafe.Slice((*byte)(buf), int(length))
+// Write sends all of data (or until timeoutMs elapses). When echo is set it
+// writes one byte at a time and waits to read the same byte back, so it holds
+// the read conch too (half-duplex / RS-485 echoing devices).
+func (p *portHandle) Write(data []byte, timeoutMs int64, echo bool) error {
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 
-	if echoMode != 0 {
-		return writeEcho(h, data, deadline)
+	if err := acquire(p.writeConch, deadline); err != nil {
+		return err
 	}
-	return writeNormal(h, data, deadline)
+
+	defer func() { p.writeConch <- struct{}{} }()
+
+	if echo {
+		if err := acquire(p.readConch, deadline); err != nil {
+			return err
+		}
+
+		defer func() { p.readConch <- struct{}{} }()
+		return p.writeEcho(data, deadline)
+	}
+
+	return p.writeNormal(data, deadline)
 }
 
-func writeNormal(h *portHandle, data []byte, deadline time.Time) *C.char {
+func (p *portHandle) writeNormal(data []byte, deadline time.Time) error {
 	written := 0
+
 	for written < len(data) {
-		n, err := h.port.Write(data[written:])
+		n, err := p.port.Write(data[written:])
+
 		written += n
+
 		if err != nil {
-			return cErr(err)
+			return err
 		}
 		if written < len(data) && time.Now().After(deadline) {
-			return cErrf("Timeout writing to port: %d of %d bytes written", written, len(data))
+			return fmt.Errorf("Timeout writing to port: %d of %d bytes written", written, len(data))
 		}
 	}
+
 	return nil
 }
 
 // writeEcho writes one byte at a time and waits to read the same byte back
 // before moving on (used for half-duplex/echoing devices such as RS-485).
-func writeEcho(h *portHandle, data []byte, deadline time.Time) *C.char {
+func (p *portHandle) writeEcho(data []byte, deadline time.Time) error {
 	one := make([]byte, 1)
 	for i := 0; i < len(data); i++ {
 
 		for {
-			n, err := h.port.Write(data[i : i+1])
+			n, err := p.port.Write(data[i : i+1])
 			if err != nil {
-				return cErr(err)
+				return err
 			}
 
 			if n == 1 {
@@ -352,23 +154,25 @@ func writeEcho(h *portHandle, data []byte, deadline time.Time) *C.char {
 			}
 
 			if time.Now().After(deadline) {
-				return cErrf("Timeout writing to port: %d of %d bytes written", i, len(data))
+				return fmt.Errorf("timeout writing to port: %d of %d bytes written", i, len(data))
 			}
 		}
 
 		for {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				return cErrf("Timeout writing to port: %d of %d bytes written", i, len(data))
-			}
-			if err := h.port.SetReadTimeout(remaining); err != nil {
-				return cErr(err)
+				return fmt.Errorf("timeout writing to port: %d of %d bytes written", i, len(data))
 			}
 
-			n, err := h.port.Read(one)
-			if err != nil {
-				return cErr(err)
+			if err := p.port.SetReadTimeout(remaining); err != nil {
+				return err
 			}
+
+			n, err := p.port.Read(one)
+			if err != nil {
+				return err
+			}
+
 			if n == 1 && one[0] == data[i] {
 				break
 			}
@@ -377,289 +181,150 @@ func writeEcho(h *portHandle, data []byte, deadline time.Time) *C.char {
 	return nil
 }
 
-// ---- bufferedRead --------------------------------------------------------
+// chunkSink is the destination for BufferedRead's received data. Its buffers are
+// filled by the read loop directly and handed off by ownership transfer, so the
+// bytes are never copied between the port and the consumer.
+type chunkSink interface {
+	// newBatch returns a fresh writable buffer of size bytes for the read loop to
+	// read into directly. Ownership returns to the sink via emit or free.
+	newBatch(size int) []byte
+	// emit hands the first n bytes of buf (obtained from newBatch) to the
+	// consumer and transfers ownership; buf must not be touched afterward.
+	emit(buf []byte, n int)
+	// free releases a batch obtained from newBatch that was never emitted.
+	free(buf []byte)
+}
 
-const (
-	// readChunkSize bounds a single Read() from the port.
-	readChunkSize = 4096
+// bufferedReadOpts configures a BufferedRead loop.
+type bufferedReadOpts struct {
+	// idleAllowance is how long to wait for the first byte before returning; a
+	// generous value keeps a slow-to-start device from being cut off.
+	idleAllowance time.Duration
 
-	// bufferedHighWater is the accumulated size at which a batch is flushed to
-	// the callback even without a gap in the incoming data.
-	bufferedHighWater = 8192
-)
+	// noDataTimeout is the idle allowance once data has started arriving.
+	noDataTimeout time.Duration
 
-// fsp_buffered_read streams incoming data to the C++ side (via fsp_emit_chunk)
-// until no new data arrives for noDataTimeoutMs. The initial idle allowance is
-// 10s so a slow-to-start device isn't cut off; after the first byte the caller's
-// timeout applies.
-//
-//export fsp_buffered_read
-func fsp_buffered_read(id C.longlong, noDataTimeoutMs C.int, cbID C.int) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
+	// pollTimeout bounds a single Read() poll.
+	pollTimeout time.Duration
+	// batchSize is the size of each buffer read into and handed to the sink.
+	batchSize int
+}
+
+// BufferedRead reads from the port and hands batches of received bytes to sink
+// until no new data arrives for opts.noDataTimeout. opts.idleAllowance applies
+// until the first byte, so a slow-to-start device isn't cut off. Each batch is
+// read into directly and handed to the sink by ownership transfer — no copy
+// between the port and the consumer.
+func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
+
+	// hold the read conch for the whole loop so a concurrent read can't steal bytes
+	select {
+	case <-p.readConch:
+	case <-time.After(min(30*time.Second, opts.idleAllowance)):
+		return errIOTimeout
 	}
 
-	// Accumulate incoming data and flush it to the callback in batches, rather
-	// than once per Read, to limit how often we cross the cgo/JS boundary.
-	var buf bytes.Buffer
-	tmp := make([]byte, readChunkSize)
+	defer func() { p.readConch <- struct{}{} }()
 
-	// flush emits whatever has accumulated. The C++ side copies the bytes before
-	// returning, so reusing buf's storage afterwards is safe.
+	// Read straight into batch and flush it in one piece, rather than once per
+	// Read, to limit how often the consumer crosses the cgo/JS boundary.
+	batch := sink.newBatch(opts.batchSize)
+	filled := 0
+
 	flush := func() {
-		if buf.Len() == 0 {
+		if filled == 0 {
 			return
 		}
-		data := buf.Bytes()
-		C.fsp_emit_chunk(cbID, unsafe.Pointer(&data[0]), C.int(len(data)))
-		buf.Reset()
+		sink.emit(batch, filled)
+		batch = sink.newBatch(opts.batchSize)
+		filled = 0
 	}
 
-	idleAllowance := 10 * time.Second
-	pollTimeout := 50 * time.Millisecond
-	idle := time.Duration(0)
+	// done flushes any pending data, then releases the trailing (empty) batch.
+	done := func(err error) error {
+		flush()
+		sink.free(batch)
+		return err
+	}
+
+	idleDeadline := time.Now().Add(opts.noDataTimeout)
 
 	for {
-		if idle > idleAllowance {
-			flush()
-			return nil
+		if time.Now().After(idleDeadline) {
+			return done(nil)
 		}
 
-		if err := h.port.SetReadTimeout(pollTimeout); err != nil {
-			flush()
-			return cErr(err)
+		if err := p.port.SetReadTimeout(opts.pollTimeout); err != nil {
+			return done(err)
 		}
 
-		n, err := h.port.Read(tmp)
+		n, err := p.port.Read(batch[filled:])
 		if err != nil {
-			flush()
-			return cErr(err)
+			return done(err)
 		}
 
 		if n == 0 {
 			// gap in the data: emit what we have so the consumer sees it promptly
 			flush()
-			idle += pollTimeout
 			continue
 		}
 
-		buf.Write(tmp[:n])
-		if buf.Len() >= bufferedHighWater {
+		idleDeadline = time.Now().Add(opts.idleAllowance)
+
+		filled += n
+		if filled >= len(batch) {
 			flush()
 		}
-
-		idle = 0
-		idleAllowance = time.Duration(noDataTimeoutMs) * time.Millisecond
 	}
 }
 
-// ---- update / set / get / getBaudRate ------------------------------------
-
-//export fsp_update
-func fsp_update(id C.longlong, optsJSON *C.char) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
+// SetBaudRate updates the baud rate (ignored when 0) and re-applies the full mode.
+func (p *portHandle) SetBaudRate(baud int) error {
+	if baud != 0 {
+		p.mode.BaudRate = baud
 	}
-
-	opts := struct {
-		BaudRate int `json:"baudRate"`
-	}{}
-	if err := json.Unmarshal([]byte(C.GoString(optsJSON)), &opts); err != nil {
-		return cErr(err)
-	}
-
-	if opts.BaudRate != 0 {
-		h.mode.BaudRate = opts.BaudRate
-	}
-	return cErr(h.port.SetMode(h.mode))
+	return p.port.SetMode(p.mode)
 }
 
-//export fsp_set
-func fsp_set(id C.longlong, optsJSON *C.char) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
+func (p *portHandle) BaudRate() int {
+	return p.mode.BaudRate
+}
 
-	opts := struct {
-		Rts *bool `json:"rts"`
-		Dtr *bool `json:"dtr"`
-		Brk *bool `json:"brk"`
-	}{}
-	if err := json.Unmarshal([]byte(C.GoString(optsJSON)), &opts); err != nil {
-		return cErr(err)
-	}
-
-	if opts.Rts != nil {
-		if err := h.port.SetRTS(*opts.Rts); err != nil {
-			return cErr(err)
+// ApplyControlLines sets RTS/DTR when non-nil and pulses a break when brk is true.
+func (p *portHandle) ApplyControlLines(rts, dtr, brk *bool) error {
+	if rts != nil {
+		if err := p.port.SetRTS(*rts); err != nil {
+			return err
 		}
 	}
-	if opts.Dtr != nil {
-		if err := h.port.SetDTR(*opts.Dtr); err != nil {
-			return cErr(err)
+	if dtr != nil {
+		if err := p.port.SetDTR(*dtr); err != nil {
+			return err
 		}
 	}
-	if opts.Brk != nil && *opts.Brk {
-		if err := h.port.Break(250 * time.Millisecond); err != nil {
-			return cErr(err)
+	if brk != nil && *brk {
+		if err := p.port.Break(250 * time.Millisecond); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-//export fsp_get
-func fsp_get(id C.longlong, outJSON **C.char) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
+func (p *portHandle) ModemStatus() (*serial.ModemStatusBits, error) {
+	return p.port.GetModemStatusBits()
+}
+
+func (p *portHandle) Drain() error {
+	return p.port.Drain()
+}
+
+// Flush discards buffered input and output.
+func (p *portHandle) Flush() error {
+	if err := p.port.ResetInputBuffer(); err != nil {
+		return err
 	}
 
-	bits, err := h.port.GetModemStatusBits()
-	if err != nil {
-		return cErr(err)
-	}
-
-	data, err := json.Marshal(map[string]bool{
-		"cts": bits.CTS,
-		"dsr": bits.DSR,
-		"dcd": bits.DCD,
-	})
-	if err != nil {
-		return cErr(err)
-	}
-
-	*outJSON = C.CString(string(data))
-	return nil
-}
-
-//export fsp_get_baud_rate
-func fsp_get_baud_rate(id C.longlong, outBaud *C.int) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
-	*outBaud = C.int(h.mode.BaudRate)
-	return nil
-}
-
-// ---- drain / flush -------------------------------------------------------
-
-//export fsp_drain
-func fsp_drain(id C.longlong) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
-	return cErr(h.port.Drain())
-}
-
-//export fsp_flush
-func fsp_flush(id C.longlong) *C.char {
-	h := getHandle(int64(id))
-	if h == nil {
-		return cErrf("invalid handle %d", int64(id))
-	}
-	if err := h.port.ResetInputBuffer(); err != nil {
-		return cErr(err)
-	}
-	return cErr(h.port.ResetOutputBuffer())
-}
-
-// ---- async dispatch ------------------------------------------------------
-//
-// The node-addon-api layer calls these instead of the synchronous fsp_*
-// functions. Each runs the operation and reports the outcome through
-// fsp_complete. The work still runs synchronously on the calling thread; a
-// later step will move it onto a goroutine so the caller returns immediately.
-
-func completeErr(cbID C.int, err *C.char) {
-	C.fsp_complete(cbID, err, nil)
-}
-
-// completeNum reports a numeric success value (encoded as JSON so the C++ side
-// can parse it into a JS number). On error the value is dropped.
-func completeNum(cbID C.int, err *C.char, n int64) {
-	if err != nil {
-		C.fsp_complete(cbID, err, nil)
-		return
-	}
-	C.fsp_complete(cbID, nil, C.CString(strconv.FormatInt(n, 10)))
-}
-
-//export fsp_list_async
-func fsp_list_async(cbID C.int) {
-	var out *C.char
-	err := fsp_list(&out)
-	C.fsp_complete(cbID, err, out)
-}
-
-//export fsp_open_async
-func fsp_open_async(path *C.char, optsJSON *C.char, cbID C.int) {
-	var h C.longlong
-	err := fsp_open(path, optsJSON, &h)
-	completeNum(cbID, err, int64(h))
-}
-
-//export fsp_close_async
-func fsp_close_async(id C.longlong, cbID C.int) {
-	completeErr(cbID, fsp_close(id))
-}
-
-//export fsp_read_async
-func fsp_read_async(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, cbID C.int) {
-	var n C.int
-	err := fsp_read(id, buf, length, timeoutMs, &n)
-	completeNum(cbID, err, int64(n))
-}
-
-//export fsp_write_async
-func fsp_write_async(id C.longlong, buf unsafe.Pointer, length C.int, timeoutMs C.int, echoMode C.int, cbID C.int) {
-	completeErr(cbID, fsp_write(id, buf, length, timeoutMs, echoMode))
-}
-
-//export fsp_update_async
-func fsp_update_async(id C.longlong, optsJSON *C.char, cbID C.int) {
-	completeErr(cbID, fsp_update(id, optsJSON))
-}
-
-//export fsp_set_async
-func fsp_set_async(id C.longlong, optsJSON *C.char, cbID C.int) {
-	completeErr(cbID, fsp_set(id, optsJSON))
-}
-
-//export fsp_get_async
-func fsp_get_async(id C.longlong, cbID C.int) {
-	var out *C.char
-	err := fsp_get(id, &out)
-	C.fsp_complete(cbID, err, out)
-}
-
-//export fsp_get_baud_rate_async
-func fsp_get_baud_rate_async(id C.longlong, cbID C.int) {
-	var b C.int
-	err := fsp_get_baud_rate(id, &b)
-	completeNum(cbID, err, int64(b))
-}
-
-//export fsp_drain_async
-func fsp_drain_async(id C.longlong, cbID C.int) {
-	completeErr(cbID, fsp_drain(id))
-}
-
-//export fsp_flush_async
-func fsp_flush_async(id C.longlong, cbID C.int) {
-	completeErr(cbID, fsp_flush(id))
-}
-
-// fsp_buffered_read_async streams chunks to dataCbID (via fsp_emit_chunk inside
-// fsp_buffered_read) and reports the loop's exit to doneCbID.
-//
-//export fsp_buffered_read_async
-func fsp_buffered_read_async(id C.longlong, noDataTimeoutMs C.int, dataCbID C.int, doneCbID C.int) {
-	completeErr(doneCbID, fsp_buffered_read(id, noDataTimeoutMs, dataCbID))
+	return p.port.ResetOutputBuffer()
 }
 
 func main() {}

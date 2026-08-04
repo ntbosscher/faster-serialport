@@ -14,7 +14,6 @@
 #include <map>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "libserial.h"
 
@@ -88,8 +87,12 @@ int makeCbId(Napi::Env env, Napi::Function cb, const char* name,
 
 // ---- bufferedRead chunk plumbing -----------------------------------------
 
+// Chunk carries one received batch across the ThreadSafeFunction queue. data is
+// a Go-malloc'd buffer owned by us until it is wrapped in a JS Buffer (whose
+// finalizer then frees it).
 struct Chunk {
-  std::vector<char> bytes;
+  void* data;
+  size_t len;
 };
 
 std::mutex g_tsfn_mu;
@@ -194,6 +197,28 @@ Napi::Value BufferedRead(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// BufferedReadExt is BufferedRead with the loop tuning passed through as a JSON
+// options object (info[1]) instead of a single timeout.
+Napi::Value BufferedReadExt(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  long long handle = asHandle(info[0]);
+  std::string opts = jsonStringify(env, info[1]);
+  auto dataCb = info[2].As<Napi::Function>();
+  auto doneCb = info[3].As<Napi::Function>();
+
+  auto dataTsfn =
+      Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read_ext", 0, 1);
+  int dataCbId = registerTsfn(dataTsfn);
+
+  auto doneTsfn = Napi::ThreadSafeFunction::New(
+      env, doneCb, "fsp_buffered_read_ext_done", 0, 1);
+  int doneCbId =
+      registerPending(doneTsfn, Napi::Reference<Napi::Buffer<char>>(), dataCbId);
+
+  fsp_buffered_read_ext_async(handle, &opts[0], dataCbId, doneCbId);
+  return env.Undefined();
+}
+
 Napi::Value Update(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   long long handle = asHandle(info[0]);
@@ -254,6 +279,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("close", Napi::Function::New(env, Close));
   exports.Set("read", Napi::Function::New(env, Read));
   exports.Set("bufferedRead", Napi::Function::New(env, BufferedRead));
+  exports.Set("bufferedReadExt", Napi::Function::New(env, BufferedReadExt));
   exports.Set("write", Napi::Function::New(env, Write));
   exports.Set("update", Napi::Function::New(env, Update));
   exports.Set("set", Napi::Function::New(env, Set));
@@ -329,33 +355,38 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
 }
 
 // fsp_emit_chunk is called from the Go bufferedRead loop (on the calling thread)
-// once per received chunk. It copies the bytes and enqueues them for the JS data
-// callback registered under cbId. NonBlockingCall so it can't deadlock when the
-// Go loop runs on the loop thread.
+// once per received chunk. data is a Go-malloc'd buffer whose ownership passes
+// to us: it is wrapped in a JS Buffer without copying and freed (via fsp_free)
+// when V8 collects that Buffer. NonBlockingCall so it can't deadlock when the Go
+// loop runs on the loop thread.
 extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
   Napi::ThreadSafeFunction tsfn;
   {
     std::lock_guard<std::mutex> lock(g_tsfn_mu);
     auto it = g_tsfns.find(cbId);
     if (it == g_tsfns.end()) {
+      // No consumer for this id: we own the buffer, so free it.
+      fsp_free(data);
       return;
     }
     tsfn = it->second;
   }
 
-  auto* chunk = new Chunk();
-  chunk->bytes.assign(static_cast<char*>(data),
-                      static_cast<char*>(data) + len);
+  auto* chunk = new Chunk{data, static_cast<size_t>(len)};
 
   napi_status status = tsfn.NonBlockingCall(
       chunk, [](Napi::Env env, Napi::Function jsCallback, Chunk* c) {
-        Napi::Buffer<char> buf =
-            Napi::Buffer<char>::Copy(env, c->bytes.data(), c->bytes.size());
+        // Wrap the Go-allocated buffer without copying; V8 frees it via the
+        // finalizer when the JS Buffer is garbage-collected.
+        Napi::Buffer<char> buf = Napi::Buffer<char>::New(
+            env, static_cast<char*>(c->data), c->len,
+            [](Napi::Env, char* d) { fsp_free(d); });
         jsCallback.Call({buf});
         delete c;
       });
 
   if (status != napi_ok) {
+    fsp_free(data);  // couldn't enqueue; free the buffer we own
     delete chunk;
   }
 }
