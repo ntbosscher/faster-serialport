@@ -41,6 +41,10 @@ func newPortHandle(port serial.Port, mode *serial.Mode) *portHandle {
 
 var errIOTimeout = errors.New("i/o operation timed out")
 
+// modeChangeTimeout bounds how long a mode change (SetBaudRate) waits for an
+// in-flight read/write to finish before giving up with a timeout.
+const modeChangeTimeout = 30 * time.Second
+
 // acquire takes conch, giving up with a timeout error if it isn't free before
 // deadline.
 func acquire(conch chan struct{}, deadline time.Time) error {
@@ -293,7 +297,24 @@ func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
 }
 
 // SetBaudRate updates the baud rate (ignored when 0) and re-applies the full mode.
+//
+// It holds both conches for the duration so the mode change can't race an
+// in-flight read or write. Conches are taken write-before-read to match Write's
+// echo path (a consistent order avoids an AB-BA deadlock), and the wait is
+// bounded by modeChangeTimeout so it can't hang behind a long-running read.
 func (p *portHandle) SetBaudRate(baud int) error {
+	deadline := time.Now().Add(modeChangeTimeout)
+
+	if err := acquire(p.writeConch, deadline); err != nil {
+		return err
+	}
+	defer func() { p.writeConch <- struct{}{} }()
+
+	if err := acquire(p.readConch, deadline); err != nil {
+		return err
+	}
+	defer func() { p.readConch <- struct{}{} }()
+
 	p.muMode.Lock()
 	defer p.muMode.Unlock()
 
