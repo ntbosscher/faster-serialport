@@ -46,9 +46,11 @@ struct PendingOp {
   Napi::ThreadSafeFunction tsfn;
   Napi::Reference<Napi::Buffer<char>> bufferRef;
   std::string err;
-  std::string result;  // JSON-encoded success value
+  std::string result;    // JSON-encoded success value
+  long long numResult = 0;  // numeric success value (see fsp_complete_num)
   bool isError = false;
   bool hasResult = false;
+  bool hasNum = false;
   int streamCbId = 0;  // bufferedRead's streaming TSFN, released on completion
 };
 
@@ -298,50 +300,31 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
-}  // namespace
-
-// fsp_complete is called from a Go fsp_*_async wrapper to report an operation's
-// outcome. It resolves the JS promise for cbId via that call's ThreadSafeFunction
-// (NonBlockingCall so it can't deadlock when invoked on the loop thread). It
-// takes ownership of the err / resultJson strings and frees them.
-extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
-  PendingOp* op = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_pending_mu);
-    auto it = g_pending.find(cbId);
-    if (it != g_pending.end()) {
-      op = it->second;
-      g_pending.erase(it);
-    }
+// takePending removes and returns the pending op for id, or nullptr if the id is
+// unknown (e.g. already completed).
+PendingOp* takePending(int cbId) {
+  std::lock_guard<std::mutex> lock(g_pending_mu);
+  auto it = g_pending.find(cbId);
+  if (it == g_pending.end()) {
+    return nullptr;
   }
+  PendingOp* op = it->second;
+  g_pending.erase(it);
+  return op;
+}
 
-  if (op == nullptr) {
-    // Unknown id: free the Go-allocated strings so they don't leak.
-    if (err != nullptr) {
-      fsp_free(err);
-    }
-    if (resultJson != nullptr) {
-      fsp_free(resultJson);
-    }
-    return;
-  }
-
-  if (err != nullptr) {
-    op->err = err;
-    op->isError = true;
-    fsp_free(err);
-  }
-  if (resultJson != nullptr) {
-    op->result = resultJson;
-    op->hasResult = true;
-    fsp_free(resultJson);
-  }
-
+// resolvePending hands op's filled-in outcome to its JS callback on the loop
+// thread (NonBlockingCall so it can't deadlock when invoked on the loop thread)
+// and releases the op's resources.
+void resolvePending(PendingOp* op) {
   Napi::ThreadSafeFunction tsfn = op->tsfn;
   napi_status status = tsfn.NonBlockingCall(
       op, [](Napi::Env env, Napi::Function cb, PendingOp* op) {
         if (op->isError) {
           cb.Call({Napi::Error::New(env, op->err).Value()});
+        } else if (op->hasNum) {
+          cb.Call({env.Null(),
+                   Napi::Number::New(env, static_cast<double>(op->numResult))});
         } else if (op->hasResult) {
           cb.Call({env.Null(), jsonParse(env, op->result)});
         } else {
@@ -364,6 +347,51 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
     delete op;
   }
   tsfn.Release();
+}
+
+}  // namespace
+
+// fsp_complete is called from a Go fsp_*_async wrapper to report an operation's
+// outcome with an error or a JSON-encoded success value. It takes ownership of
+// the err / resultJson strings and frees them.
+extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
+  PendingOp* op = takePending(cbId);
+  if (op == nullptr) {
+    // Unknown id: free the Go-allocated strings so they don't leak.
+    if (err != nullptr) {
+      fsp_free(err);
+    }
+    if (resultJson != nullptr) {
+      fsp_free(resultJson);
+    }
+    return;
+  }
+
+  if (err != nullptr) {
+    op->err = err;
+    op->isError = true;
+    fsp_free(err);
+  }
+  if (resultJson != nullptr) {
+    op->result = resultJson;
+    op->hasResult = true;
+    fsp_free(resultJson);
+  }
+
+  resolvePending(op);
+}
+
+// fsp_complete_num is fsp_complete's fast path for a numeric success value: it
+// resolves the JS promise with a JS number directly, skipping the JSON encode on
+// the Go side and the JSON.parse here. Errors still report through fsp_complete.
+extern "C" void fsp_complete_num(int cbId, long long value) {
+  PendingOp* op = takePending(cbId);
+  if (op == nullptr) {
+    return;
+  }
+  op->numResult = value;
+  op->hasNum = true;
+  resolvePending(op);
 }
 
 // fsp_emit_chunk is called from the Go bufferedRead loop once per received

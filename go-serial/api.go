@@ -18,6 +18,7 @@ extern "C" {
 #endif
 extern void fsp_emit_chunk(int cbId, void* data, int len);
 extern void fsp_complete(int cbId, char* err, char* resultJson);
+extern void fsp_complete_num(int cbId, long long value);
 #ifdef __cplusplus
 }
 #endif
@@ -30,7 +31,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -56,8 +56,8 @@ func completeErr(cbID C.int, err error) {
 	C.fsp_complete(cbID, C.CString(err.Error()), nil)
 }
 
-// completeNum reports a numeric success value (encoded as JSON so the C++ side
-// can parse it into a JS number). On error the value is dropped.
+// completeNum reports a numeric success value directly as a JS number (no JSON
+// round-trip). On error the value is dropped.
 func completeNum(cbID C.int, err error, n int64) {
 
 	if err != nil {
@@ -65,7 +65,7 @@ func completeNum(cbID C.int, err error, n int64) {
 		return
 	}
 
-	C.fsp_complete(cbID, nil, C.CString(strconv.FormatInt(n, 10)))
+	C.fsp_complete_num(cbID, C.longlong(n))
 }
 
 // ---- logging -------------------------------------------------------------
