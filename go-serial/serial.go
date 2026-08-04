@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.bug.st/serial"
@@ -13,7 +14,11 @@ import (
 // can change a single field (baudRate) and re-apply the whole mode.
 type portHandle struct {
 	port serial.Port
-	mode *serial.Mode
+
+	// muMode guards mode, which SetBaudRate mutates and BaudRate reads outside
+	// the read/write conches.
+	muMode sync.Mutex
+	mode   *serial.Mode
 
 	readConch  chan struct{}
 	writeConch chan struct{}
@@ -280,6 +285,9 @@ func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
 
 // SetBaudRate updates the baud rate (ignored when 0) and re-applies the full mode.
 func (p *portHandle) SetBaudRate(baud int) error {
+	p.muMode.Lock()
+	defer p.muMode.Unlock()
+
 	if baud != 0 {
 		p.mode.BaudRate = baud
 	}
@@ -287,6 +295,9 @@ func (p *portHandle) SetBaudRate(baud int) error {
 }
 
 func (p *portHandle) BaudRate() int {
+	p.muMode.Lock()
+	defer p.muMode.Unlock()
+
 	return p.mode.BaudRate
 }
 
