@@ -3,7 +3,39 @@
 
 This is a stripped down, more performant version of [node-serialport](https://github.com/serialport/node-serialport). Actually works normally with Electron.
 
-Currently only supports windows and mac.
+Supports macOS, Linux, and Windows.
+
+## How it works
+
+The serial I/O is implemented in Go using [go.bug.st/serial](https://github.com/bugst/go-serial),
+compiled to a C static archive (`go build -buildmode=c-archive`). A thin
+[node-addon-api](https://github.com/nodejs/node-addon-api) (C++) layer links that
+archive and exposes it to `lib/index.js`.
+
+```
+lib/index.js  ──▶  lib/bindings.js  ──▶  faster-serialport.node (C++)  ──▶  libserial.a (Go)  ──▶  go.bug.st/serial
+```
+
+## Building from source
+
+Requires a **Go toolchain** (1.21+), a C++ compiler, and Node's build tools.
+
+```sh
+npm install        # runs `npm run build` (build:go + build:addon)
+```
+
+- `npm run build:go` compiles `go-serial/` into `build-go/libserial.a`
+- `npm run build:addon` runs `node-gyp rebuild` to compile `src/addon.cc` and link the archive
+
+### Notes / limitations
+
+- Software/hardware flow control options (`rtscts`, `xon`, `xoff`, `xany`) are
+  accepted for API compatibility but are not applied — `go.bug.st/serial` does
+  not expose flow-control configuration.
+- `eventsCallback` is accepted but not fired by the native layer.
+- On Windows the Go archive (GNU `ar`) must be linked with a toolchain that can
+  consume it; this path is configured in `binding.gyp` but has not been
+  validated on this platform.
 
 ## API 
 ```js
@@ -70,30 +102,3 @@ function pollForAnyData() {
 This package would not be possible without the folks over at [node-serialport](https://github.com/serialport/node-serialport). This started out
 as a fork of their package and has morphed into something new.
 
-## Known Issues
-
-### Electron on Windows: Some actions fail within the first 5 seconds. 
-
-Reloading the page via `location.reload()` or `location = "/"` fixes this issue.
-
-### Electron: Error: Could not locate the bindings file. Tried:...
-
-1. Ensure you have `electron-builder` setup correctly.
-
-e.g. package.json
-```
-{
-     "scripts": {
-        "postinstall": "electron-builder install-app-deps",
-     }
-}
-```
-
-2. Symbolicly link `<project-root>/prebuilds/<platform>/<target>.node` => `build/Release/faster-serial-port.node` (fixes electron issue with `bindings` root issue)
-
-## Dev
-
-```
-npm install -g prebuildify node-gyp yarn
-brew install gcc
-```

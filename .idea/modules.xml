@@ -3,7 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/faster-serialport.iml" filepath="$PROJECT_DIR$/.idea/faster-serialport.iml" />
-      <module fileurl="file://$PROJECT_DIR$/.idea/faster-serialport1.iml" filepath="$PROJECT_DIR$/.idea/faster-serialport1.iml" />
+      <module fileurl="file://$PROJECT_DIR$/go-serial/go-serial.iml" filepath="$PROJECT_DIR$/go-serial/go-serial.iml" />
     </modules>
   </component>
 </project>

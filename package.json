@@ -8,25 +8,20 @@
     "serial"
   ],
   "dependencies": {
-    "@serialport/binding-abstract": "^9.0.2",
-    "@serialport/parser-readline": "^9.0.1",
-    "debug": "^4.1.1",
-    "nan": "2.25.0",
-    "node-bindings": "https://github.com/ntbosscher/node-bindings"
+    "node-addon-api": "^8.0.0"
   },
   "devDependencies": {
-    "@serialport/binding-mock": "^9.0.2",
-    "node-abi": "3.8.0",
-    "node-cmake": "^2.5.1",
-    "prebuildify": "6.0.1",
-    "node-gyp": "12.2.0"
-  },
-  "engines": {
-    "node": ">=8.6.0"
+    "node-gyp": "^11.0.0"
   },
   "scripts": {
-    "build": "prebuildify -t electron@40.8.1",
-    "lint": "cc --verbose"
+    "build:go": "node scripts/build-go.js",
+    "build:addon": "node-gyp rebuild",
+    "build": "npm run build:go && npm run build:addon",
+    "install": "npm run build",
+    "rebuild": "npm run build"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "publishConfig": {
     "access": "public"
@@ -35,17 +30,5 @@
   "repository": {
     "type": "git",
     "url": "git://github.com/ntbosscher/faster-serialport"
-  },
-  "gypfile": true,
-  "cc": {
-    "filter": [
-      "legal/copyright",
-      "build/include"
-    ],
-    "files": [
-      "src/*.cpp",
-      "src/*.h"
-    ],
-    "linelength": "120"
   }
 }
