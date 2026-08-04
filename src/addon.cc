@@ -95,6 +95,12 @@ struct Chunk {
   size_t len;
 };
 
+// Bounded depth for a bufferedRead stream's chunk queue. When the JS consumer
+// falls behind, fsp_emit_chunk's BlockingCall parks the Go reader thread until
+// the loop drains a slot, so native memory (one malloc'd batch per queued chunk)
+// can't grow without bound. 64 * batchSize (default 8192) ≈ 512 KiB ceiling.
+constexpr size_t kChunkQueueDepth = 64;
+
 std::mutex g_tsfn_mu;
 std::map<int, Napi::ThreadSafeFunction> g_tsfns;
 int g_next_cb_id = 1;
@@ -181,9 +187,10 @@ Napi::Value BufferedRead(const Napi::CallbackInfo& info) {
   auto doneCb = info[3].As<Napi::Function>();
 
   // Streaming callback for received chunks. Created before the done slot so its
-  // queued chunks are processed ahead of the done resolution.
-  auto dataTsfn =
-      Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read", 0, 1);
+  // queued chunks are processed ahead of the done resolution. Bounded queue so a
+  // slow consumer applies backpressure to the Go reader (see fsp_emit_chunk).
+  auto dataTsfn = Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read",
+                                                kChunkQueueDepth, 1);
   int dataCbId = registerTsfn(dataTsfn);
 
   // Done callback resolves via fsp_complete, which also releases the streaming
@@ -206,8 +213,8 @@ Napi::Value BufferedReadExt(const Napi::CallbackInfo& info) {
   auto dataCb = info[2].As<Napi::Function>();
   auto doneCb = info[3].As<Napi::Function>();
 
-  auto dataTsfn =
-      Napi::ThreadSafeFunction::New(env, dataCb, "fsp_buffered_read_ext", 0, 1);
+  auto dataTsfn = Napi::ThreadSafeFunction::New(
+      env, dataCb, "fsp_buffered_read_ext", kChunkQueueDepth, 1);
   int dataCbId = registerTsfn(dataTsfn);
 
   auto doneTsfn = Napi::ThreadSafeFunction::New(
@@ -354,11 +361,14 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
   tsfn.Release();
 }
 
-// fsp_emit_chunk is called from the Go bufferedRead loop (on the calling thread)
-// once per received chunk. data is a Go-malloc'd buffer whose ownership passes
-// to us: it is wrapped in a JS Buffer without copying and freed (via fsp_free)
-// when V8 collects that Buffer. NonBlockingCall so it can't deadlock when the Go
-// loop runs on the loop thread.
+// fsp_emit_chunk is called from the Go bufferedRead loop once per received
+// chunk. data is a Go-malloc'd buffer whose ownership passes to us: it is wrapped
+// in a JS Buffer without copying and freed (via fsp_free) when V8 collects that
+// Buffer. BlockingCall applies backpressure: when the bounded queue
+// (kChunkQueueDepth) is full it parks the caller until the loop drains a slot.
+// This is safe from deadlock because BufferedRead — the only caller — always runs
+// on a Go goroutine thread, never the libuv loop thread (unlike fsp_complete,
+// which can, and so stays non-blocking).
 extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
   Napi::ThreadSafeFunction tsfn;
   {
@@ -374,7 +384,7 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
 
   auto* chunk = new Chunk{data, static_cast<size_t>(len)};
 
-  napi_status status = tsfn.NonBlockingCall(
+  napi_status status = tsfn.BlockingCall(
       chunk, [](Napi::Env env, Napi::Function jsCallback, Chunk* c) {
         // Wrap the Go-allocated buffer without copying; V8 frees it via the
         // finalizer when the JS Buffer is garbage-collected.
