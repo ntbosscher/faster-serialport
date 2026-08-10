@@ -4,7 +4,7 @@
       "target_name": "faster-serialport",
       "sources": [ "src/addon.cc" ],
       "include_dirs": [
-        "<!@(node -p \"require('node-addon-api').include_dir\")",
+        "<!@(node -p \"require('path').resolve(require('node-addon-api').include_dir)\")",
         "<(module_root_dir)/build-go"
       ],
       "defines": [ "NAPI_VERSION=8", "NODE_ADDON_API_CPP_EXCEPTIONS" ],
