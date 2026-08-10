@@ -141,12 +141,25 @@ Napi::Value List(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// Bounded depth for a port's events callback queue. Events are infrequent, but a
+// bounded queue applies backpressure to the Go watcher (fsp_emit_event uses
+// BlockingCall) instead of growing without bound if JS falls behind.
+constexpr size_t kEventQueueDepth = 16;
+
 Napi::Value Open(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   std::string path = info[0].As<Napi::String>();
   std::string opts = jsonStringify(env, info[1]);
-  int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_open");
-  fsp_open_async(&path[0], &opts[0], cbId);
+
+  // Persistent events callback, alive for the port's lifetime and released when
+  // Go reports the close (fsp_release_event). Created before the open completes
+  // so the watcher has a valid slot as soon as the port opens.
+  auto eventsTsfn = Napi::ThreadSafeFunction::New(
+      env, info[2].As<Napi::Function>(), "fsp_events", kEventQueueDepth, 1);
+  int eventCbId = registerTsfn(eventsTsfn);
+
+  int cbId = makeCbId(env, info[3].As<Napi::Function>(), "fsp_open");
+  fsp_open_async(&path[0], &opts[0], eventCbId, cbId);
   return env.Undefined();
 }
 
@@ -433,5 +446,61 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
     delete chunk;
   }
 }
+
+// Event carries one comm event across the ThreadSafeFunction queue: a failure
+// (err set, with errorCode) or a Win32 EV_* mask (event). err is a Go-malloc'd
+// string owned by us until the JS callback runs, then freed via fsp_free.
+struct Event {
+  char* err;
+  int errorCode;
+  int event;
+};
+
+// fsp_emit_event is called from the Go comm-event watcher (a goroutine thread,
+// so BlockingCall is safe) to invoke a port's eventsCallback. It mirrors the
+// callback-last (err, arg) shape callers expect: on failure cb(Error, {errorCode}),
+// otherwise cb(null, {event}).
+extern "C" void fsp_emit_event(int cbId, char* err, int errorCode, int event) {
+  Napi::ThreadSafeFunction tsfn;
+  {
+    std::lock_guard<std::mutex> lock(g_tsfn_mu);
+    auto it = g_tsfns.find(cbId);
+    if (it == g_tsfns.end()) {
+      if (err != nullptr) {
+        fsp_free(err);
+      }
+      return;
+    }
+    tsfn = it->second;
+  }
+
+  auto* ev = new Event{err, errorCode, event};
+
+  napi_status status = tsfn.BlockingCall(
+      ev, [](Napi::Env env, Napi::Function jsCallback, Event* e) {
+        Napi::Object arg = Napi::Object::New(env);
+        if (e->err != nullptr) {
+          arg.Set("errorCode", Napi::Number::New(env, e->errorCode));
+          jsCallback.Call({Napi::Error::New(env, e->err).Value(), arg});
+          fsp_free(e->err);
+        } else {
+          arg.Set("event", Napi::Number::New(env, e->event));
+          jsCallback.Call({env.Null(), arg});
+        }
+        delete e;
+      });
+
+  if (status != napi_ok) {
+    if (err != nullptr) {
+      fsp_free(err);
+    }
+    delete ev;
+  }
+}
+
+// fsp_release_event releases a port's persistent events callback slot. Called
+// from Go once the port has closed (watcher stopped, no further emits) or when no
+// watcher was started.
+extern "C" void fsp_release_event(int cbId) { releaseTsfn(cbId); }
 
 NODE_API_MODULE(faster_serialport, Init)

@@ -19,6 +19,13 @@ extern "C" {
 extern void fsp_emit_chunk(int cbId, void* data, int len);
 extern void fsp_complete(int cbId, char* err, char* resultJson);
 extern void fsp_complete_num(int cbId, long long value);
+
+// fsp_emit_event delivers one comm event to the port's eventsCallback: err is
+// non-NULL (with errorCode set) on a failure, otherwise event holds the Win32
+// EV_* mask. The C++ side takes ownership of err and frees it. fsp_release_event
+// releases the persistent events callback slot when the port closes.
+extern void fsp_emit_event(int cbId, char* err, int errorCode, int event);
+extern void fsp_release_event(int cbId);
 #ifdef __cplusplus
 }
 #endif
@@ -207,15 +214,17 @@ func modeFromOpts(o openOpts) (*serial.Mode, error) {
 }
 
 //export fsp_open_async
-func fsp_open_async(path *C.char, optsJSON *C.char, cbID C.int) {
+func fsp_open_async(path *C.char, optsJSON *C.char, eventCbID C.int, cbID C.int) {
 	opts := openOpts{}
 	if err := json.Unmarshal([]byte(C.GoString(optsJSON)), &opts); err != nil {
+		C.fsp_release_event(eventCbID)
 		completeErr(cbID, err)
 		return
 	}
 
 	mode, err := modeFromOpts(opts)
 	if err != nil {
+		C.fsp_release_event(eventCbID)
 		completeErr(cbID, err)
 		return
 	}
@@ -227,7 +236,28 @@ func fsp_open_async(path *C.char, optsJSON *C.char, cbID C.int) {
 
 		id, err := manager.Open(name, mode)
 		logf("open %s -> handle %d", name, id)
-		completeNum(cbID, err, id)
+		if err != nil {
+			C.fsp_release_event(eventCbID)
+			completeErr(cbID, err)
+			return
+		}
+
+		// Attach the comm-event watcher. If none started (non-Windows, or the
+		// handle couldn't be reached), release the callback slot now so it
+		// doesn't leak — the port stays open, just without events.
+		h := manager.get(id)
+		emit := func(err error, errorCode int, event int) {
+			var cErr *C.char
+			if err != nil {
+				cErr = C.CString(err.Error())
+			}
+			C.fsp_emit_event(eventCbID, cErr, C.int(errorCode), C.int(event))
+		}
+		if h == nil || !h.StartEvents(int(eventCbID), emit) {
+			C.fsp_release_event(eventCbID)
+		}
+
+		completeNum(cbID, nil, id)
 	}()
 }
 
@@ -240,11 +270,18 @@ func fsp_close_async(id C.longlong, cbID C.int) {
 		return
 	}
 
+	eventCbID := port.eventCbID
+
 	go func() {
 		defer autoRecover(cbID)
 
 		err := port.Close()
 		manager.remove(int64(id))
+
+		// Close stopped the watcher (no more emits); release its callback slot.
+		if eventCbID != 0 {
+			C.fsp_release_event(C.int(eventCbID))
+		}
 
 		logf("close handle %d", int64(id))
 		completeErr(cbID, err)

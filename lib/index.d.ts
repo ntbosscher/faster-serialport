@@ -14,7 +14,10 @@ export default class FasterSerialPort {
       xany: boolean;
       xoff: boolean;
       xon: boolean;
-      eventsCallback: (err: string | null, arg: {event?: number, errorCode?: number}) => void;
+      // Fired on Windows only (native WaitCommEvent). On a line-status change
+      // err is null and arg.event is the Win32 EV_* mask; on device loss err is
+      // an Error and arg.errorCode is the Win32 error code (e.g. 5 = access denied).
+      eventsCallback: (err: Error | null, arg: {event?: number, errorCode?: number}) => void;
     }>);
   
     write(buf: Buffer | number[], echoMode: boolean = false): Promise<void>;

@@ -32,7 +32,15 @@ npm install        # runs `npm run build` (build:go + build:addon)
 - Software/hardware flow control options (`rtscts`, `xon`, `xoff`, `xany`) are
   accepted for API compatibility but are not applied — `go.bug.st/serial` does
   not expose flow-control configuration.
-- `eventsCallback` is accepted but not fired by the native layer.
+- `eventsCallback(err, arg)` is fired on **Windows only**, driven by a native
+  `WaitCommEvent` loop. On a line-status change `arg.event` holds the raw Win32
+  `EV_*` mask (e.g. `64` = `EV_BREAK`); when the device goes away the callback
+  receives an `Error` with `arg.errorCode` set (e.g. `5` = `ERROR_ACCESS_DENIED`).
+  On macOS/Linux there is no comm-event equivalent, so the callback never fires —
+  a disconnect still surfaces as an error from the next `read`/`write`. The
+  Windows path reads the port `HANDLE` out of `go.bug.st/serial` via reflection
+  (its private struct layout), so it must be re-checked when that dependency is
+  upgraded.
 - On Windows the Go archive (GNU `ar`) must be linked with a toolchain that can
   consume it; this path is configured in `binding.gyp` but has not been
   validated on this platform.

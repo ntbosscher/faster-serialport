@@ -22,6 +22,11 @@ type portHandle struct {
 
 	readConch  chan struct{}
 	writeConch chan struct{}
+
+	// events, when non-nil, is the running comm-event watcher; eventCbID is the
+	// C++ callback slot it emits through, released on Close (see api.go).
+	events    *eventWatcher
+	eventCbID int
 }
 
 func newPortHandle(port serial.Port, mode *serial.Mode) *portHandle {
@@ -59,7 +64,27 @@ func acquire(conch chan struct{}, deadline time.Time) error {
 	}
 }
 
+// StartEvents begins watching the port for comm events. It returns false if no
+// watcher could be started (non-Windows, or the handle couldn't be reached), so
+// the caller can release the callback slot immediately.
+func (p *portHandle) StartEvents(cbID int, emit func(err error, errorCode int, event int)) bool {
+	w := startEventWatcher(p.port, emit)
+	if w == nil {
+		return false
+	}
+
+	p.events = w
+	p.eventCbID = cbID
+	return true
+}
+
 func (p *portHandle) Close() error {
+	// Stop the event watcher before closing so its pending WaitCommEvent is
+	// cancelled against a still-valid handle and no event can fire after close.
+	if p.events != nil {
+		p.events.Stop()
+	}
+
 	// close is special and doesn't require locking "conch"
 	return p.port.Close()
 }
