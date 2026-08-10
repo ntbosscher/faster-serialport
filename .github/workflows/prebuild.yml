@@ -19,8 +19,8 @@ jobs:
         include:
           - { name: darwin-arm64, os: macos-14,       target_arch: arm64, node_arch: arm64 }
           - { name: darwin-x64,   os: macos-13,       target_arch: x64,   node_arch: x64 }
-          - { name: win32-x64,    os: windows-latest, target_arch: x64,   node_arch: x64,  mingw: x64 }
-          - { name: win32-ia32,   os: windows-latest, target_arch: ia32,  node_arch: x86,  mingw: x86 }
+          - { name: win32-x64,    os: windows-latest, target_arch: x64,   node_arch: x64,  msystem: MINGW64, mingw_dir: mingw64, mingw_pkg: mingw-w64-x86_64-gcc }
+          - { name: win32-ia32,   os: windows-latest, target_arch: ia32,  node_arch: x86,  msystem: MINGW32, mingw_dir: mingw32, mingw_pkg: mingw-w64-i686-gcc }
     steps:
       - uses: actions/checkout@v4
 
@@ -30,21 +30,22 @@ jobs:
 
       # Windows cgo builds the Go c-archive with gcc; install a known mingw so
       # the compiler (and its arch) are deterministic rather than whatever the
-      # runner happens to ship. Sets CC to the arch-specific gcc.
+      # runner happens to ship. MINGW64 gives x86_64 gcc, MINGW32 gives i686.
       - name: Set up mingw (Windows)
+        id: msys2
         if: runner.os == 'Windows'
-        uses: egor-tensin/setup-mingw@v2
+        uses: msys2/setup-msys2@v2
         with:
-          platform: ${{ matrix.mingw }}
+          msystem: ${{ matrix.msystem }}
+          install: ${{ matrix.mingw_pkg }}
+      # The build steps run in the normal Windows shell, not `msys2 {0}`, so put
+      # the msystem's gcc on PATH for them. Its frontend is plain `gcc`.
       - name: Point cgo at mingw (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          if [ "${{ matrix.target_arch }}" = "ia32" ]; then
-            echo "CC=i686-w64-mingw32-gcc" >> "$GITHUB_ENV"
-          else
-            echo "CC=x86_64-w64-mingw32-gcc" >> "$GITHUB_ENV"
-          fi
+          "${{ steps.msys2.outputs.msys2-location }}\${{ matrix.mingw_dir }}\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC=gcc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: actions/setup-node@v4
         with:
