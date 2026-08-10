@@ -432,11 +432,12 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
 
   napi_status status = tsfn.BlockingCall(
       chunk, [](Napi::Env env, Napi::Function jsCallback, Chunk* c) {
-        // Wrap the Go-allocated buffer without copying; V8 frees it via the
-        // finalizer when the JS Buffer is garbage-collected.
-        Napi::Buffer<char> buf = Napi::Buffer<char>::New(
-            env, static_cast<char*>(c->data), c->len,
-            [](Napi::Env, char* d) { fsp_free(d); });
+        // Copy into a V8-owned buffer. External (zero-copy) buffers via
+        // napi_create_external_buffer are rejected (napi_no_external_buffers_allowed)
+        // under Electron's V8 sandbox, which threw here and dropped every chunk.
+        Napi::Buffer<char> buf =
+            Napi::Buffer<char>::Copy(env, static_cast<char*>(c->data), c->len);
+        fsp_free(c->data);  // Go buffer is copied out; free it now
         jsCallback.Call({buf});
         delete c;
       });

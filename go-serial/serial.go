@@ -287,7 +287,11 @@ func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
 		batch = sink.newBatch(opts.batchSize)
 	}
 
-	idleDeadline := time.Now().Add(opts.noDataTimeout)
+	// Wait the generous idleAllowance for the first byte (a slow-to-start device
+	// isn't cut off); once data has arrived, only wait the short noDataTimeout for
+	// more before returning, so a caller with buffered data isn't stuck waiting on
+	// a long tail at the end of a stream. Callers wanting more can re-call.
+	idleDeadline := time.Now().Add(opts.idleAllowance)
 
 	for {
 		if time.Now().After(idleDeadline) {
@@ -312,7 +316,7 @@ func (p *portHandle) BufferedRead(opts bufferedReadOpts, sink chunkSink) error {
 			continue
 		}
 
-		idleDeadline = time.Now().Add(opts.idleAllowance)
+		idleDeadline = time.Now().Add(opts.noDataTimeout)
 
 		filled += n
 		if filled >= len(batch) {
