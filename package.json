@@ -1,8 +1,9 @@
 {
   "name": "faster-serialport",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "main": "lib",
   "types": "./lib/index.d.ts",
+  "gypfile": false,
   "keywords": [
     "serialport",
     "serial"
