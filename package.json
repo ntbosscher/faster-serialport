@@ -23,6 +23,8 @@
     "build:addon": "node-gyp rebuild",
     "build": "npm run build:go && npm run build:addon",
     "build:darwin:x64": "TARGET_ARCH=x64 node scripts/build-go.js && node-gyp rebuild --arch=x64 && TARGET_ARCH=x64 node scripts/copy-prebuild.js",
+    "build:darwin:arm64": "TARGET_ARCH=arm64 node scripts/build-go.js && node-gyp rebuild --arch=arm64 && TARGET_ARCH=arm64 node scripts/copy-prebuild.js",
+    "build:darwin": "npm run build:darwin:arm64 && npm run build:darwin:x64",
     "dist": "npm run build && node scripts/copy-prebuild.js"
   },
   "engines": {

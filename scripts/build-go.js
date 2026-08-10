@@ -30,6 +30,16 @@ if (process.platform === "darwin") {
   env.CGO_LDFLAGS = (env.CGO_LDFLAGS ? env.CGO_LDFLAGS + " " : "") + flags;
 }
 
+// cgo compiles the c-archive glue with mingw gcc, but binding.gyp links the
+// archive into the .node with MSVC. Modern mingw headers default to their own
+// ANSI stdio (__mingw_fprintf et al. from libmingwex), which MSVC can't
+// resolve. Force the msvcrt stdio so the glue references plain fprintf, which
+// the MSVC link provides.
+if (process.platform === "win32") {
+  const flags = "-D__USE_MINGW_ANSI_STDIO=0";
+  env.CGO_CFLAGS = (env.CGO_CFLAGS ? env.CGO_CFLAGS + " " : "") + flags;
+}
+
 execFileSync("go", ["build", "-buildmode=c-archive", "-o", out, "."], {
   cwd: path.join(root, "go-serial"),
   stdio: "inherit",
