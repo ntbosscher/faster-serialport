@@ -1,8 +1,5 @@
 .DS_Store
 *.test.js
-build/
-build-go/
-CHANGELOG.md
 lib/mocks
 *.log
 *.db

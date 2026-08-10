@@ -1,0 +1,87 @@
+name: prebuild
+
+# Builds the native addon for every shipped platform/arch and bundles the
+# results into a single downloadable "prebuilds" artifact. Download it into the
+# repo root (so prebuilds/ is populated) before running `npm publish`.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: darwin-arm64, os: macos-14,       target_arch: arm64, node_arch: arm64 }
+          - { name: darwin-x64,   os: macos-13,       target_arch: x64,   node_arch: x64 }
+          - { name: win32-x64,    os: windows-latest, target_arch: x64,   node_arch: x64,  mingw: x64 }
+          - { name: win32-ia32,   os: windows-latest, target_arch: ia32,  node_arch: x86,  mingw: x86 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-serial/go.mod
+
+      # Windows cgo builds the Go c-archive with gcc; install a known mingw so
+      # the compiler (and its arch) are deterministic rather than whatever the
+      # runner happens to ship. Sets CC to the arch-specific gcc.
+      - name: Set up mingw (Windows)
+        if: runner.os == 'Windows'
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: ${{ matrix.mingw }}
+      - name: Point cgo at mingw (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ matrix.target_arch }}" = "ia32" ]; then
+            echo "CC=i686-w64-mingw32-gcc" >> "$GITHUB_ENV"
+          else
+            echo "CC=x86_64-w64-mingw32-gcc" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          architecture: ${{ matrix.node_arch }}
+
+      - run: npm ci
+
+      - name: Build Go archive
+        run: npm run build:go
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
+
+      - name: Build addon
+        run: npx node-gyp rebuild --arch=${{ matrix.target_arch }}
+
+      - name: Stage prebuild
+        run: node scripts/copy-prebuild.js
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.name }}
+          path: prebuilds/
+
+  bundle:
+    name: bundle prebuilds
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          merge-multiple: true
+          path: prebuilds
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds
+          path: prebuilds/

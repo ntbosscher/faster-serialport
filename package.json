@@ -7,6 +7,11 @@
     "serialport",
     "serial"
   ],
+  "files": [
+    "lib/",
+    "!lib/mocks",
+    "prebuilds/"
+  ],
   "dependencies": {
     "node-addon-api": "^8.0.0"
   },
@@ -17,8 +22,7 @@
     "build:go": "node scripts/build-go.js",
     "build:addon": "node-gyp rebuild",
     "build": "npm run build:go && npm run build:addon",
-    "install": "npm run build",
-    "rebuild": "npm run build"
+    "dist": "npm run build && node scripts/copy-prebuild.js"
   },
   "engines": {
     "node": ">=18.0.0"
