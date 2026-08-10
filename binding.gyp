@@ -39,7 +39,8 @@
             "-lwinmm"
           ],
           "msvs_settings": {
-            "VCCLCompilerTool": { "ExceptionHandling": 1 }
+            "VCCLCompilerTool": { "ExceptionHandling": 1 },
+            "VCLinkerTool": { "ImageHasSafeExceptionHandlers": "false" }
           }
         } ]
       ]
