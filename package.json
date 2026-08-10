@@ -16,7 +16,7 @@
     "node-addon-api": "^8.0.0"
   },
   "devDependencies": {
-    "node-gyp": "^11.0.0"
+    "node-gyp": "^12.0.0"
   },
   "scripts": {
     "build:go": "node scripts/build-go.js",
