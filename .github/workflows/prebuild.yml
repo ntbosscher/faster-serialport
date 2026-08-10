@@ -51,7 +51,10 @@ jobs:
           node-version: 20
           architecture: ${{ matrix.node_arch }}
 
-      - run: npm ci
+      # binding.gyp at the repo root makes npm implicitly run `node-gyp rebuild`
+      # on install; skip it so the addon is built only after build:go generates
+      # build-go/libserial.{a,h}.
+      - run: npm ci --ignore-scripts
 
       - name: Build Go archive
         run: npm run build:go
