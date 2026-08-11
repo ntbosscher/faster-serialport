@@ -1,0 +1,58 @@
+name: test-win-arm64
+
+# Standalone manual build of the Windows ARM64 prebuild, isolated from the full
+# prebuild matrix so the new toolchain (windows-11-arm + msys2 CLANGARM64) can be
+# exercised on demand without cutting a tag. Fold back into prebuild.yml once green.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: win32-arm64
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-serial/go.mod
+
+      # CLANGARM64 is the only msys2 environment targeting aarch64; the gcc-compat
+      # package provides a `gcc` frontend (wrapping clang) so CC=gcc works unchanged.
+      - name: Set up mingw
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          install: mingw-w64-clang-aarch64-gcc-compat
+
+      - name: Point cgo at mingw
+        shell: pwsh
+        run: |
+          "${{ steps.msys2.outputs.msys2-location }}\clangarm64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC=gcc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          architecture: arm64
+
+      - run: npm ci --ignore-scripts
+
+      - name: Build Go archive
+        run: npm run build:go
+        env:
+          TARGET_ARCH: arm64
+
+      - name: Build addon
+        run: npx node-gyp rebuild --arch=arm64
+
+      - name: Stage prebuild
+        run: node scripts/copy-prebuild.js
+        env:
+          TARGET_ARCH: arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-win32-arm64
+          path: prebuilds/
