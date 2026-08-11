@@ -16,3 +16,12 @@ fs.mkdirSync(destDir, { recursive: true });
 fs.copyFileSync(src, dest);
 
 console.log("staged " + dest);
+
+// Windows loads the Go backend as a sibling DLL at runtime (see src/addon.cc),
+// so it must ship alongside the addon.
+if (process.platform === "win32") {
+  const dll = "libserial.dll";
+  const dllDest = path.join(destDir, dll);
+  fs.copyFileSync(path.join(root, "build-go", dll), dllDest);
+  console.log("staged " + dllDest);
+}

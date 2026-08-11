@@ -10,7 +10,12 @@ const root = path.resolve(__dirname, "..");
 const outDir = path.join(root, "build-go");
 fs.mkdirSync(outDir, { recursive: true });
 
-const out = path.join(outDir, "libserial.a");
+// Windows links the Go backend as a runtime-loaded DLL (c-shared) rather than a
+// static archive: loading the DLL runs the Go runtime's init, which MSVC never
+// triggered for a linked-in mingw c-archive (leaving every cgo call hung).
+// Everywhere else the static archive links directly into the addon.
+const isWin = process.platform === "win32";
+const out = path.join(outDir, isWin ? "libserial.dll" : "libserial.a");
 
 // Target arch defaults to the host; CI sets TARGET_ARCH to build one prebuild
 // per arch. Keep the mapping in sync with scripts/copy-prebuild.js.
@@ -40,7 +45,17 @@ if (process.platform === "win32") {
   env.CGO_CFLAGS = (env.CGO_CFLAGS ? env.CGO_CFLAGS + " " : "") + flags;
 }
 
-execFileSync("go", ["build", "-buildmode=c-archive", "-o", out, "."], {
+const buildArgs = ["build", isWin ? "-buildmode=c-shared" : "-buildmode=c-archive"];
+
+// Statically link mingw's runtime into the DLL so the shipped libserial.dll has
+// no external mingw dependencies (libgcc, libwinpthread) to resolve at load.
+if (isWin) {
+  buildArgs.push("-ldflags", "-extldflags=-static");
+}
+
+buildArgs.push("-o", out, ".");
+
+execFileSync("go", buildArgs, {
   cwd: path.join(root, "go-serial"),
   stdio: "inherit",
   env,

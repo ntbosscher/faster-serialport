@@ -3,32 +3,48 @@ package main
 /*
 #include <stdlib.h>
 
-// fsp_emit_chunk is implemented on the C++ (node-addon-api) side. The Go
-// bufferedRead loop calls it once per chunk of received data. data is a
-// malloc'd buffer whose ownership transfers to the C++ side: it wraps it in a
-// JS Buffer without copying and frees it (via fsp_free) when V8 collects that
-// Buffer.
+// The C++ (node-addon-api) side owns these callbacks and registers them once at
+// startup via fsp_set_callbacks. We invoke them through function pointers
+// rather than as link-time symbols so this package can be built as a
+// self-contained shared library (Windows libserial.dll) that still calls back
+// into the host .node: a Windows DLL cannot resolve symbols from the module
+// that loads it, so the host hands us the addresses instead. cgo cannot call a
+// C function pointer directly, so each callback goes through a tiny shim.
 //
-// fsp_complete is also implemented on the C++ side. Each fsp_*_async wrapper
-// calls it exactly once to report its result: err is non-NULL on failure,
-// resultJSON holds the JSON-encoded success value (or NULL when the operation
-// has no result). The C++ side takes ownership of both strings and frees them.
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern void fsp_emit_chunk(int cbId, void* data, int len);
-extern void fsp_complete(int cbId, char* err, char* resultJson);
-extern void fsp_complete_num(int cbId, long long value);
-
-// fsp_emit_event delivers one comm event to the port's eventsCallback: err is
-// non-NULL (with errorCode set) on a failure, otherwise event holds the Win32
-// EV_* mask. The C++ side takes ownership of err and frees it. fsp_release_event
+// fsp_emit_chunk streams one received bufferedRead batch to the consumer: data
+// is a malloc'd buffer whose ownership transfers to the C++ side (it copies the
+// bytes into a JS Buffer and frees data via fsp_free).
+//
+// fsp_complete reports an operation's result exactly once: err is non-NULL on
+// failure, resultJSON holds the JSON-encoded success value (or NULL when the
+// operation has no result). The C++ side takes ownership of both strings and
+// frees them.
+//
+// fsp_emit_event delivers one comm event to a port's eventsCallback: err is
+// non-NULL (with errorCode) on a failure, otherwise event holds the Win32 EV_*
+// mask. The C++ side takes ownership of err and frees it. fsp_release_event
 // releases the persistent events callback slot when the port closes.
-extern void fsp_emit_event(int cbId, char* err, int errorCode, int event);
-extern void fsp_release_event(int cbId);
-#ifdef __cplusplus
+typedef void (*fsp_emit_chunk_fn)(int cbId, void* data, int len);
+typedef void (*fsp_complete_fn)(int cbId, char* err, char* resultJson);
+typedef void (*fsp_complete_num_fn)(int cbId, long long value);
+typedef void (*fsp_emit_event_fn)(int cbId, char* err, int errorCode, int event);
+typedef void (*fsp_release_event_fn)(int cbId);
+
+static inline void fsp_do_emit_chunk(void* fn, int cbId, void* data, int len) {
+	((fsp_emit_chunk_fn)fn)(cbId, data, len);
 }
-#endif
+static inline void fsp_do_complete(void* fn, int cbId, char* err, char* resultJson) {
+	((fsp_complete_fn)fn)(cbId, err, resultJson);
+}
+static inline void fsp_do_complete_num(void* fn, int cbId, long long value) {
+	((fsp_complete_num_fn)fn)(cbId, value);
+}
+static inline void fsp_do_emit_event(void* fn, int cbId, char* err, int errorCode, int event) {
+	((fsp_emit_event_fn)fn)(cbId, err, errorCode, event);
+}
+static inline void fsp_do_release_event(void* fn, int cbId) {
+	((fsp_release_event_fn)fn)(cbId);
+}
 */
 import "C"
 import (
@@ -51,16 +67,37 @@ func fsp_free(p unsafe.Pointer) {
 	C.free(p)
 }
 
+// Host callbacks, each a C function pointer (host code, not Go memory) invoked
+// through the fsp_do_* shims. The C++ side registers them once via
+// fsp_set_callbacks before any operation runs; afterwards they're only read
+// (from goroutines), so no synchronisation is needed.
+var (
+	cbEmitChunk    unsafe.Pointer
+	cbComplete     unsafe.Pointer
+	cbCompleteNum  unsafe.Pointer
+	cbEmitEvent    unsafe.Pointer
+	cbReleaseEvent unsafe.Pointer
+)
+
+//export fsp_set_callbacks
+func fsp_set_callbacks(emitChunk, complete, completeNum, emitEvent, releaseEvent unsafe.Pointer) {
+	cbEmitChunk = emitChunk
+	cbComplete = complete
+	cbCompleteNum = completeNum
+	cbEmitEvent = emitEvent
+	cbReleaseEvent = releaseEvent
+}
+
 // ---- completion ----------------------------------------------------------
 
 // completeErr reports an operation with no success value: err is nil on success.
 // A non-nil error is converted to a malloc'd C string that the C++ side frees.
 func completeErr(cbID C.int, err error) {
 	if err == nil {
-		C.fsp_complete(cbID, nil, nil)
+		C.fsp_do_complete(cbComplete, cbID, nil, nil)
 		return
 	}
-	C.fsp_complete(cbID, C.CString(err.Error()), nil)
+	C.fsp_do_complete(cbComplete, cbID, C.CString(err.Error()), nil)
 }
 
 // completeNum reports a numeric success value directly as a JS number (no JSON
@@ -72,7 +109,7 @@ func completeNum(cbID C.int, err error, n int64) {
 		return
 	}
 
-	C.fsp_complete_num(cbID, C.longlong(n))
+	C.fsp_do_complete_num(cbCompleteNum, cbID, C.longlong(n))
 }
 
 // ---- logging -------------------------------------------------------------
@@ -158,7 +195,7 @@ func fsp_list_async(cbID C.int) {
 			return
 		}
 
-		C.fsp_complete(cbID, nil, C.CString(string(data)))
+		C.fsp_do_complete(cbComplete, cbID, nil, C.CString(string(data)))
 	}()
 }
 
@@ -217,14 +254,14 @@ func modeFromOpts(o openOpts) (*serial.Mode, error) {
 func fsp_open_async(path *C.char, optsJSON *C.char, eventCbID C.int, cbID C.int) {
 	opts := openOpts{}
 	if err := json.Unmarshal([]byte(C.GoString(optsJSON)), &opts); err != nil {
-		C.fsp_release_event(eventCbID)
+		C.fsp_do_release_event(cbReleaseEvent, eventCbID)
 		completeErr(cbID, err)
 		return
 	}
 
 	mode, err := modeFromOpts(opts)
 	if err != nil {
-		C.fsp_release_event(eventCbID)
+		C.fsp_do_release_event(cbReleaseEvent, eventCbID)
 		completeErr(cbID, err)
 		return
 	}
@@ -237,7 +274,7 @@ func fsp_open_async(path *C.char, optsJSON *C.char, eventCbID C.int, cbID C.int)
 		id, err := manager.Open(name, mode)
 		logf("open %s -> handle %d", name, id)
 		if err != nil {
-			C.fsp_release_event(eventCbID)
+			C.fsp_do_release_event(cbReleaseEvent, eventCbID)
 			completeErr(cbID, err)
 			return
 		}
@@ -251,10 +288,10 @@ func fsp_open_async(path *C.char, optsJSON *C.char, eventCbID C.int, cbID C.int)
 			if err != nil {
 				cErr = C.CString(err.Error())
 			}
-			C.fsp_emit_event(eventCbID, cErr, C.int(errorCode), C.int(event))
+			C.fsp_do_emit_event(cbEmitEvent, eventCbID, cErr, C.int(errorCode), C.int(event))
 		}
 		if h == nil || !h.StartEvents(int(eventCbID), emit) {
-			C.fsp_release_event(eventCbID)
+			C.fsp_do_release_event(cbReleaseEvent, eventCbID)
 		}
 
 		completeNum(cbID, nil, id)
@@ -280,7 +317,7 @@ func fsp_close_async(id C.longlong, cbID C.int) {
 
 		// Close stopped the watcher (no more emits); release its callback slot.
 		if eventCbID != 0 {
-			C.fsp_release_event(C.int(eventCbID))
+			C.fsp_do_release_event(cbReleaseEvent, C.int(eventCbID))
 		}
 
 		logf("close handle %d", int64(id))
@@ -348,7 +385,7 @@ func (s cChunkSink) newBatch(size int) []byte {
 }
 
 func (s cChunkSink) emit(buf []byte, n int) {
-	C.fsp_emit_chunk(s.dataCbID, unsafe.Pointer(&buf[0]), C.int(n))
+	C.fsp_do_emit_chunk(cbEmitChunk, s.dataCbID, unsafe.Pointer(&buf[0]), C.int(n))
 }
 
 func (s cChunkSink) free(buf []byte) {
@@ -505,7 +542,7 @@ func fsp_get_async(id C.longlong, cbID C.int) {
 			return
 		}
 
-		C.fsp_complete(cbID, nil, C.CString(string(data)))
+		C.fsp_do_complete(cbComplete, cbID, nil, C.CString(string(data)))
 	}()
 }
 

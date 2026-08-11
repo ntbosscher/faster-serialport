@@ -32,12 +32,8 @@
           ]
         } ],
         [ "OS==\"win\"", {
-          "libraries": [
-            "<(module_root_dir)/build-go/libserial.a",
-            "-lntdll",
-            "-lws2_32",
-            "-lwinmm"
-          ],
+          # libserial.dll is loaded at runtime (see src/addon.cc), not linked
+          # here; its transitive libs are static-linked into the DLL by build-go.js.
           "msvs_settings": {
             "VCCLCompilerTool": { "ExceptionHandling": 1 },
             "VCLinkerTool": { "ImageHasSafeExceptionHandlers": "false" }

@@ -1,9 +1,10 @@
-// node-addon-api bridge between lib/bindings.js and the Go c-archive
-// (go-serial). One-shot binding functions dispatch straight into the Go
-// c-archive (fsp_*_async) and return immediately; Go reports the result back
-// through fsp_complete, which resolves the JS promise on the loop thread via a
-// per-call Napi::ThreadSafeFunction. The callback-last contract that
-// lib/bindings.js expects is preserved: cb(err, result).
+// node-addon-api bridge between lib/bindings.js and the Go backend (go-serial),
+// reached through goApi — a static c-archive on macOS/Linux, or a runtime-loaded
+// libserial.dll on Windows (see the Go backend binding section below). One-shot
+// binding functions dispatch straight into Go (goApi.*_async) and return
+// immediately; Go reports the result back through fsp_complete, which resolves
+// the JS promise on the loop thread via a per-call Napi::ThreadSafeFunction. The
+// callback-last contract that lib/bindings.js expects is preserved: cb(err, result).
 //
 // bufferedRead follows the same dispatch: it runs synchronously in Go and
 // reports completion through fsp_complete, but additionally streams received
@@ -15,7 +16,21 @@
 #include <mutex>
 #include <string>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include "libserial.h"
+
+// Completion/streaming callbacks the Go side invokes (defined at the bottom of
+// this file). Their addresses are handed to Go via goApi.set_callbacks in Init.
+extern "C" void fsp_complete(int cbId, char* err, char* resultJson);
+extern "C" void fsp_complete_num(int cbId, long long value);
+extern "C" void fsp_emit_chunk(int cbId, void* data, int len);
+extern "C" void fsp_emit_event(int cbId, char* err, int errorCode, int event);
+extern "C" void fsp_release_event(int cbId);
 
 namespace {
 
@@ -128,6 +143,115 @@ void releaseTsfn(int id) {
   tsfn.Release();
 }
 
+// ---- Go backend binding --------------------------------------------------
+//
+// The Go backend ships as libserial: a static c-archive linked straight into
+// this addon on macOS/Linux, or a c-shared libserial.dll loaded at runtime on
+// Windows. The runtime load is deliberate — it runs the Go runtime's DLL
+// initialisation, which never happened when a mingw c-archive was linked with
+// MSVC, leaving every cgo call hung on an uninitialised runtime. All Go entry
+// points are called through goApi so the call sites don't care which form it is.
+
+struct GoApi {
+  void (*free)(void*);
+  void (*configure_logging)(int, char*);
+  void (*list_async)(int);
+  void (*open_async)(char*, char*, int, int);
+  void (*close_async)(long long, int);
+  void (*read_async)(long long, void*, int, int, int);
+  void (*write_async)(long long, void*, int, int, int, int);
+  void (*buffered_read_async)(long long, int, int, int);
+  void (*buffered_read_ext_async)(long long, char*, int, int);
+  void (*update_async)(long long, char*, int);
+  void (*set_async)(long long, char*, int);
+  void (*get_async)(long long, int);
+  void (*get_baud_rate_async)(long long, int);
+  void (*drain_async)(long long, int);
+  void (*flush_async)(long long, int);
+  void (*set_callbacks)(void*, void*, void*, void*, void*);
+};
+
+GoApi goApi;
+
+#ifdef _WIN32
+// bindGoApi loads libserial.dll from beside this .node (so the Go runtime's DLL
+// init runs) and resolves every export. Returns an error string on failure.
+const char* bindGoApi() {
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&bindGoApi), &self)) {
+    return "could not locate the addon module";
+  }
+
+  wchar_t buf[MAX_PATH];
+  DWORD n = GetModuleFileNameW(self, buf, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return "could not resolve the addon path";
+  }
+
+  // Load the DLL sitting next to this .node by full path, so it resolves
+  // regardless of the process's working directory or DLL search path.
+  std::wstring full(buf, n);
+  size_t sep = full.find_last_of(L"\\/");
+  std::wstring dll =
+      (sep == std::wstring::npos ? L"" : full.substr(0, sep + 1)) +
+      L"libserial.dll";
+
+  HMODULE h =
+      LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  if (h == nullptr) {
+    return "could not load libserial.dll";
+  }
+
+#define FSP_BIND(field, name)                                             \
+  goApi.field = reinterpret_cast<decltype(goApi.field)>(                  \
+      reinterpret_cast<void*>(GetProcAddress(h, name)));                  \
+  if (goApi.field == nullptr) return "missing export " name;
+
+  FSP_BIND(free, "fsp_free")
+  FSP_BIND(configure_logging, "fsp_configure_logging")
+  FSP_BIND(list_async, "fsp_list_async")
+  FSP_BIND(open_async, "fsp_open_async")
+  FSP_BIND(close_async, "fsp_close_async")
+  FSP_BIND(read_async, "fsp_read_async")
+  FSP_BIND(write_async, "fsp_write_async")
+  FSP_BIND(buffered_read_async, "fsp_buffered_read_async")
+  FSP_BIND(buffered_read_ext_async, "fsp_buffered_read_ext_async")
+  FSP_BIND(update_async, "fsp_update_async")
+  FSP_BIND(set_async, "fsp_set_async")
+  FSP_BIND(get_async, "fsp_get_async")
+  FSP_BIND(get_baud_rate_async, "fsp_get_baud_rate_async")
+  FSP_BIND(drain_async, "fsp_drain_async")
+  FSP_BIND(flush_async, "fsp_flush_async")
+  FSP_BIND(set_callbacks, "fsp_set_callbacks")
+#undef FSP_BIND
+
+  return nullptr;
+}
+#else
+// The c-archive is statically linked, so the exports are ordinary symbols.
+const char* bindGoApi() {
+  goApi.free = fsp_free;
+  goApi.configure_logging = fsp_configure_logging;
+  goApi.list_async = fsp_list_async;
+  goApi.open_async = fsp_open_async;
+  goApi.close_async = fsp_close_async;
+  goApi.read_async = fsp_read_async;
+  goApi.write_async = fsp_write_async;
+  goApi.buffered_read_async = fsp_buffered_read_async;
+  goApi.buffered_read_ext_async = fsp_buffered_read_ext_async;
+  goApi.update_async = fsp_update_async;
+  goApi.set_async = fsp_set_async;
+  goApi.get_async = fsp_get_async;
+  goApi.get_baud_rate_async = fsp_get_baud_rate_async;
+  goApi.drain_async = fsp_drain_async;
+  goApi.flush_async = fsp_flush_async;
+  goApi.set_callbacks = fsp_set_callbacks;
+  return nullptr;
+}
+#endif
+
 // ---- JS-facing functions -------------------------------------------------
 
 long long asHandle(Napi::Value v) {
@@ -137,7 +261,7 @@ long long asHandle(Napi::Value v) {
 Napi::Value List(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[0].As<Napi::Function>(), "fsp_list");
-  fsp_list_async(cbId);
+  goApi.list_async(cbId);
   return env.Undefined();
 }
 
@@ -159,14 +283,14 @@ Napi::Value Open(const Napi::CallbackInfo& info) {
   int eventCbId = registerTsfn(eventsTsfn);
 
   int cbId = makeCbId(env, info[3].As<Napi::Function>(), "fsp_open");
-  fsp_open_async(&path[0], &opts[0], eventCbId, cbId);
+  goApi.open_async(&path[0], &opts[0], eventCbId, cbId);
   return env.Undefined();
 }
 
 Napi::Value Close(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_close");
-  fsp_close_async(asHandle(info[0]), cbId);
+  goApi.close_async(asHandle(info[0]), cbId);
   return env.Undefined();
 }
 
@@ -178,7 +302,7 @@ Napi::Value Read(const Napi::CallbackInfo& info) {
   int length = info[3].As<Napi::Number>().Int32Value();
   int timeout = info[4].As<Napi::Number>().Int32Value();
   int cbId = makeCbId(env, info[5].As<Napi::Function>(), "fsp_read", buffer);
-  fsp_read_async(handle, buffer.Data() + offset, length, timeout, cbId);
+  goApi.read_async(handle, buffer.Data() + offset, length, timeout, cbId);
   return env.Undefined();
 }
 
@@ -189,7 +313,7 @@ Napi::Value Write(const Napi::CallbackInfo& info) {
   int timeout = info[2].As<Napi::Number>().Int32Value();
   int echoMode = info[3].As<Napi::Boolean>().Value() ? 1 : 0;
   int cbId = makeCbId(env, info[4].As<Napi::Function>(), "fsp_write", buffer);
-  fsp_write_async(handle, buffer.Data(), static_cast<int>(buffer.Length()),
+  goApi.write_async(handle, buffer.Data(), static_cast<int>(buffer.Length()),
                   timeout, echoMode, cbId);
   return env.Undefined();
 }
@@ -215,7 +339,7 @@ Napi::Value BufferedRead(const Napi::CallbackInfo& info) {
   int doneCbId =
       registerPending(doneTsfn, Napi::Reference<Napi::Buffer<char>>(), dataCbId);
 
-  fsp_buffered_read_async(handle, timeout, dataCbId, doneCbId);
+  goApi.buffered_read_async(handle, timeout, dataCbId, doneCbId);
   return env.Undefined();
 }
 
@@ -237,7 +361,7 @@ Napi::Value BufferedReadExt(const Napi::CallbackInfo& info) {
   int doneCbId =
       registerPending(doneTsfn, Napi::Reference<Napi::Buffer<char>>(), dataCbId);
 
-  fsp_buffered_read_ext_async(handle, &opts[0], dataCbId, doneCbId);
+  goApi.buffered_read_ext_async(handle, &opts[0], dataCbId, doneCbId);
   return env.Undefined();
 }
 
@@ -246,7 +370,7 @@ Napi::Value Update(const Napi::CallbackInfo& info) {
   long long handle = asHandle(info[0]);
   std::string opts = jsonStringify(env, info[1]);
   int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_update");
-  fsp_update_async(handle, &opts[0], cbId);
+  goApi.update_async(handle, &opts[0], cbId);
   return env.Undefined();
 }
 
@@ -255,35 +379,35 @@ Napi::Value Set(const Napi::CallbackInfo& info) {
   long long handle = asHandle(info[0]);
   std::string opts = jsonStringify(env, info[1]);
   int cbId = makeCbId(env, info[2].As<Napi::Function>(), "fsp_set");
-  fsp_set_async(handle, &opts[0], cbId);
+  goApi.set_async(handle, &opts[0], cbId);
   return env.Undefined();
 }
 
 Napi::Value Get(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_get");
-  fsp_get_async(asHandle(info[0]), cbId);
+  goApi.get_async(asHandle(info[0]), cbId);
   return env.Undefined();
 }
 
 Napi::Value GetBaudRate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_get_baud_rate");
-  fsp_get_baud_rate_async(asHandle(info[0]), cbId);
+  goApi.get_baud_rate_async(asHandle(info[0]), cbId);
   return env.Undefined();
 }
 
 Napi::Value Drain(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_drain");
-  fsp_drain_async(asHandle(info[0]), cbId);
+  goApi.drain_async(asHandle(info[0]), cbId);
   return env.Undefined();
 }
 
 Napi::Value Flush(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int cbId = makeCbId(env, info[1].As<Napi::Function>(), "fsp_flush");
-  fsp_flush_async(asHandle(info[0]), cbId);
+  goApi.flush_async(asHandle(info[0]), cbId);
   return env.Undefined();
 }
 
@@ -291,11 +415,27 @@ Napi::Value ConfigureLogging(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   int enabled = info[0].As<Napi::Boolean>().Value() ? 1 : 0;
   std::string dir = info[1].As<Napi::String>();
-  fsp_configure_logging(enabled, &dir[0]);
+  goApi.configure_logging(enabled, &dir[0]);
   return env.Undefined();
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  // Bind the Go backend before exposing anything — on Windows this loads
+  // libserial.dll and initialises the Go runtime.
+  if (const char* err = bindGoApi()) {
+    Napi::Error::New(env, std::string("faster-serialport: ") + err)
+        .ThrowAsJavaScriptException();
+    return exports;
+  }
+
+  // Hand Go the addresses of our completion/streaming callbacks so it can call
+  // back into this module (order matches fsp_set_callbacks in api.go).
+  goApi.set_callbacks(reinterpret_cast<void*>(fsp_emit_chunk),
+                      reinterpret_cast<void*>(fsp_complete),
+                      reinterpret_cast<void*>(fsp_complete_num),
+                      reinterpret_cast<void*>(fsp_emit_event),
+                      reinterpret_cast<void*>(fsp_release_event));
+
   exports.Set("list", Napi::Function::New(env, List));
   exports.Set("open", Napi::Function::New(env, Open));
   exports.Set("close", Napi::Function::New(env, Close));
@@ -372,10 +512,10 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
   if (op == nullptr) {
     // Unknown id: free the Go-allocated strings so they don't leak.
     if (err != nullptr) {
-      fsp_free(err);
+      goApi.free(err);
     }
     if (resultJson != nullptr) {
-      fsp_free(resultJson);
+      goApi.free(resultJson);
     }
     return;
   }
@@ -383,12 +523,12 @@ extern "C" void fsp_complete(int cbId, char* err, char* resultJson) {
   if (err != nullptr) {
     op->err = err;
     op->isError = true;
-    fsp_free(err);
+    goApi.free(err);
   }
   if (resultJson != nullptr) {
     op->result = resultJson;
     op->hasResult = true;
-    fsp_free(resultJson);
+    goApi.free(resultJson);
   }
 
   resolvePending(op);
@@ -422,7 +562,7 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
     auto it = g_tsfns.find(cbId);
     if (it == g_tsfns.end()) {
       // No consumer for this id: we own the buffer, so free it.
-      fsp_free(data);
+      goApi.free(data);
       return;
     }
     tsfn = it->second;
@@ -437,13 +577,13 @@ extern "C" void fsp_emit_chunk(int cbId, void* data, int len) {
         // under Electron's V8 sandbox, which threw here and dropped every chunk.
         Napi::Buffer<char> buf =
             Napi::Buffer<char>::Copy(env, static_cast<char*>(c->data), c->len);
-        fsp_free(c->data);  // Go buffer is copied out; free it now
+        goApi.free(c->data);  // Go buffer is copied out; free it now
         jsCallback.Call({buf});
         delete c;
       });
 
   if (status != napi_ok) {
-    fsp_free(data);  // couldn't enqueue; free the buffer we own
+    goApi.free(data);  // couldn't enqueue; free the buffer we own
     delete chunk;
   }
 }
@@ -468,7 +608,7 @@ extern "C" void fsp_emit_event(int cbId, char* err, int errorCode, int event) {
     auto it = g_tsfns.find(cbId);
     if (it == g_tsfns.end()) {
       if (err != nullptr) {
-        fsp_free(err);
+        goApi.free(err);
       }
       return;
     }
@@ -483,7 +623,7 @@ extern "C" void fsp_emit_event(int cbId, char* err, int errorCode, int event) {
         if (e->err != nullptr) {
           arg.Set("errorCode", Napi::Number::New(env, e->errorCode));
           jsCallback.Call({Napi::Error::New(env, e->err).Value(), arg});
-          fsp_free(e->err);
+          goApi.free(e->err);
         } else {
           arg.Set("event", Napi::Number::New(env, e->event));
           jsCallback.Call({env.Null(), arg});
@@ -493,7 +633,7 @@ extern "C" void fsp_emit_event(int cbId, char* err, int errorCode, int event) {
 
   if (status != napi_ok) {
     if (err != nullptr) {
-      fsp_free(err);
+      goApi.free(err);
     }
     delete ev;
   }
